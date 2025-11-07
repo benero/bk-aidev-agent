@@ -10,14 +10,14 @@
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-2. 初始化项目环境（虚拟环境位于项目根目录 `.venv` 下），此步骤将同步安装 `pip` 依赖
+2. 初始化项目环境（虚拟环境将创建在项目根目录 `.venv` 下），此步骤会同时安装所需的 `pip` 依赖
 ```shell
 make init
 ```
 
-### 1.2 本地环境变量
+### 1.2 本地环境变量配置
 
-1. 运行时配置可通过以下步骤设置环境变量
+1. 通过以下命令创建本地环境变量文件
 ```shell
 cp ./support-files/env.template .env
 ```
@@ -32,7 +32,7 @@ cp ./support-files/env.template .env
 
 ### 1.3 启动服务并测试
 
-在执行本地服务前，需要先将 `local.{{cookiecutter.bk_paas_domain}}` 配置到本地的 `hosts` 文件中
+在启动本地服务前，需要先将 `local.{{cookiecutter.bk_paas_domain}}` 配置到本地的 `hosts` 文件中
 
 然后，执行以下脚本启动本地服务，即可开始测试：
 
@@ -60,12 +60,12 @@ python bin/manage.py runserver local.{{cookiecutter.bk_paas_domain}}:8000
 ├── bk_plugin
 │   ├── apis
 │   │   └── urls.py # API路由配置，用于生成蓝鲸插件的用户态接口
-│   ├── extend # 用于扩展
+│   ├── extend # 用于扩展功能
 │   │   ├── agent.py # 自定义智能体扩展
 │   │   └── config_manager.py # 配置管理器扩展
-│   ├── forms # 蓝鲸插件在标准运维等场景集所的前端配置
+│   ├── forms # 蓝鲸插件在标准运维等场景使用的前端配置
 │   ├── openapi/  # 用于生成蓝鲸插件的应用态接口
-│   ├── patch # patch了默认蓝鲸插件的配置,主要是扩展了路由
+│   ├── patch # 对默认蓝鲸插件配置的补丁，主要扩展了路由
 │   │   ├── plugin.py # 插件补丁
 │   │   └── urls.py # 路由补丁
 │   ├── versions
@@ -80,7 +80,7 @@ python bin/manage.py runserver local.{{cookiecutter.bk_paas_domain}}:8000
 ├── app_desc.yml # 蓝鲸插件 app_desc 运行配置
 ├── Makefile  # 开发环境构建工具
 ├── pyproject.toml  # python uv 依赖文件
-├── README.md # 指引文档加
+├── README.md # 指引文档
 ├── requirements.txt # Python依赖包配置
 ├── runtime.txt # Python运行时版本配置
 └── uv.lock # uv 依赖锁文件
@@ -102,9 +102,9 @@ git push -u origin main
 make init-pre-commit
 ```
 
-3. 通过`make linkt`可对智能体所有代码进行检测
+3. 通过 `make lint` 可对智能体所有代码进行检测
 ```shell
-make link
+make lint
 ```
 
 ### 2.3 依赖包管理
@@ -114,7 +114,7 @@ make link
    # 平台依赖
    uv add {package_name}~=1.0.0
    # 开发环境依赖
-   uv add {package_name}~=1.0.0 -- dev
+   uv add {package_name}~=1.0.0 --dev
    ```
 2. 可以通过以下命令导出 `requirements.txt`
    ```shell
@@ -131,18 +131,19 @@ make link
     ```shell
     $ make ci-test
     ```
-3. 可以通过`path`参数查看某个模块的单测情况
+3. 可以通过 `path` 参数查看某个模块的单测情况
     ```shell
     $ make test path=./tests/xxx/
     ```
 
-### 2.5 智能体模板关联：通过以下步骤可关联并同步`AIDev`平台最新的智能体模板
-智能体模板可通过`cruft`管理并同步平台模板变更，可参考以下实现同步模板内容
+### 2.5 智能体模板关联：通过以下步骤可关联并同步 `AIDev` 平台最新的智能体模板
 
-1. 安装`cruft`
+智能体模板可通过 `cruft` 管理并同步平台模板变更，可参考以下步骤实现模板同步：
+
+1. 安装 `cruft`
 
 ```shell
-pip install cruft
+uv add cruft --dev
 ```
 
 2. 关联智能体模板
@@ -151,19 +152,19 @@ cd {{cookiecutter.project_name}}
 cruft link https://github.com/TencentBlueKing/bk-aidev-agent.git --directory template --config-file=./support-files/cookiecutter.yaml --no-input
 ```
 
-4. 提交`cruft.json`到代码仓库，请按实际代码分支处理
+3. 提交 `cruft.json` 到代码仓库，请按实际代码分支处理
 ```shell
 git add .cruft.json
 git commit -m "minor: add .cruft.json"
 git push -u origin main
 ```
 
-5. 验证模板是否已关联
+4. 验证模板是否已关联
 ```shell
 cruft check
 ```
 
-6. 模板更新检测
+5. 模板更新检测与应用
 ```shell
 cruft check
 
@@ -187,7 +188,7 @@ cruft update
       "content": "用户内容"
     },
     {
-      "role": "assitant",
+      "role": "assistant",
       "content": "AI内容"
     }
   ],
@@ -290,7 +291,7 @@ curl -X POST{{ cookiecutter.apigw_manager_url_tmpl.format(api_name=cookiecutter.
 
 ### 3.5 流式响应协议
 
-1. 请求输入格式：流式响应遵循标准的SSE响应规范。响应的data内容为JSON字符串，具体协议如下：
+1. 请求输出格式：流式响应遵循标准的SSE响应规范。响应的data内容为JSON字符串，具体协议如下：
   - event支持5种类型：text, think, reference_doc, done, error
   - text类型event，表示单个流式输出
     - 附带字段
@@ -375,4 +376,3 @@ AGENT_CONFIG = {
 
 当通用智能体无法满足业务场景时，可参考以下文档扩展智能体功能：
 [智能体定制开发指南](https://github.com/TencentBlueKing/bk-aidev-agent/tree/develop/docs/agent/EXTENSION_AGENT.md)
-

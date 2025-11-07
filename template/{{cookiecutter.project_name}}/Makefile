@@ -1,4 +1,5 @@
-# 导入子目录中的 Makefile 文件
+ROOT_DIR?=$(shell git rev-parse --show-toplevel 2>/dev/null || echo ".")
+pytest = uv run --no-sync pytest --ds settings -c ${ROOT_DIR}/pyproject.toml
 
 .PHONY: ALL
 ALL: init

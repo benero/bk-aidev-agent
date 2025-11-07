@@ -17,3 +17,66 @@ dependencies = [
     "opentelemetry-instrumentation-langchain==0.38.10",
     "tiktoken==0.11.0",
 ]
+
+
+[dependency-groups]
+dev = [
+    "pytest<9.0.0,>=8.3.4",
+    "pytest-django<5.0.0,>=4.9.0",
+    "pytest-asyncio<1.0.0,>=0.25.2",
+    "pytest-env<2.0.0,>=1.1.5",
+    "responses<1.0.0,>=0.25.6",
+    "faker<36.0.0,>=35.2.0",
+    "mock<6.0.0,>=5.1.0",
+    "requests-mock<2.0.0,>=1.12.1",
+    "pytest-mock<4.0.0,>=3.14.0",
+    "pytest-cov<7.0.0,>=6.0.0",
+    "model-bakery==1.17.0",
+    "ipdb<1.0.0,>=0.13.13",
+    "pytest-timeout<3.0.0,>=2.3.1",
+    "a2wsgi<2.0.0,>=1.7.0",
+]
+types = [
+    "celery-types<1.0.0,>=0.22.0",
+    "django-types==0.9.1",
+    "djangorestframework-stubs[compatible-mypy]<4.0.0,>=3.15.3",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+DJANGO_SETTINGS_MODULE = "settings"
+asyncio_default_fixture_loop_scope = "session"
+addopts = "-vvv "
+asyncio_mode = "auto"
+env = [
+    "BKPAAS_APP_ID=bkaidev",
+    "BKPAAS_APP_SECRET=1234567890abcdefghijklmnopqrstuvwxyz",
+    "AIDEV_SPACE_ID=mock",
+    "AIDEV_GATEWAY_NAME=bk-aidev",
+    "BK_APIGW_STAGE=stag",
+    "BK_PAAS_DOMAIN=bkpaas.com",
+    "BKPAAS_ENGINE_REGION=open",
+    "BK_APIGW_MANAGER_URL_TMPL=http://bkapi.bkpaas.com/api/{api_name}",
+    "BK_API_URL_TMPL=http://bkapi.bkpaas.com/api/{api_name}",
+    "BKPAAS_LOGIN_URL=http://bkpaas.com/login/",
+    "BKPAAS_APIGW_OAUTH_API_URL=http://bkssm.bkpaas.com"
+]
+
+
+[tool.pdm.build]
+includes = ["aidev"]
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.coverage.run]
+omit = [
+  "tests/*",
+  "*/migrations/*",
+  "blueking/*",
+  "config/*",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
