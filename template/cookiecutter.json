@@ -23,6 +23,7 @@
   "_copy_without_render": [
     ".ci",
     "*dist",
-    "*tpls"
+    "*tpls",
+    ".venv"
   ]
 }
