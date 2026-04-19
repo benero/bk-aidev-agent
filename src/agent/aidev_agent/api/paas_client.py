@@ -55,7 +55,7 @@ class Client(BaseClient):
 
 
 class BkPaaSSandboxApi:
-    _api_name = "paasv3"
+    _api_name = "paasv3" if settings.RUN_VER == "ieod" else "bkpaas3"
 
     @classmethod
     def get_client_by_request(cls, request):
