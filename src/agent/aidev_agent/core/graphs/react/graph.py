@@ -43,7 +43,7 @@ from aidev_agent.core.nodes.knowledge import make_knowledge_node
 from aidev_agent.core.nodes.model import ModelNodeSettings
 from aidev_agent.core.nodes.model import build_model_node as std_make_model_node
 from aidev_agent.core.nodes.tool import ToolNodeSettings, build_tool_node
-from aidev_agent.core.tools.add_image_to_chat_context import add_image_to_chat_context
+from aidev_agent.core.tools.add_image_to_chat_context import add_image_to_chat_context, RUNTIME_USER_STORE_KEY, RUNTIME_USER_STORE_NS
 from aidev_agent.enums import Decision
 from aidev_agent.packages.langchain_core.models import ChatModel
 from aidev_agent.packages.langchain_core.models.utils import is_model_without_function_calling
@@ -668,19 +668,30 @@ class ReActAgentBuilder:
             return checkpointer
         return MemorySaver()
 
+    def _build_runtime_user_store(
+        self,
+        *,
+        file_store: ByteStore | None,
+    ) -> dict:
+        return {
+            "file_store": file_store,
+            "image": {},
+            "knowledge_bases": self._knowledge_bases or [],
+            "knowledge_items": self._knowledge_items or [],
+            "reference_doc": [],
+        }
+
     def _prepare_store(
         self,
         *,
         store: "BaseStore | None",
         file_store: Optional[ByteStore],
     ) -> "BaseStore":
-        """使用 LangGraph Store 模拟 request_local.current_user_store。
-
-        - 默认使用 InMemoryStore
-        - 预先写入 file_store / image / knowledge_bases / knowledge_items / reference_doc
-        """
         if store is None:
             store = InMemoryStore()
+
+        runtime_user_store = self._build_runtime_user_store(file_store=file_store)
+        store.put(RUNTIME_USER_STORE_NS, RUNTIME_USER_STORE_KEY, runtime_user_store)
         return store
 
     @staticmethod

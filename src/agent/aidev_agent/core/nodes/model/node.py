@@ -37,6 +37,7 @@ from .basic_middleware import (
     DeepSeekR1VariablesMiddleware,
     SpecialVariablesMiddleware,
     SpecialVariablesPostMiddleware,
+    RuntimeUserStoreVariablesMiddleware,
 )
 from .context_assembly import ContextAssembly
 from .prompt_middleware import (
@@ -311,6 +312,10 @@ def build_model_node(
             role_prompt=node_options.role_prompt,
             enable_parallel_tool_calls=enable_parallel_tool_calls,
         ),
+    )
+    context_assembly.add_middleware(
+        "variable",
+        RuntimeUserStoreVariablesMiddleware(),
     )
     # 知识库的压缩器
     context_assembly.add_middleware(

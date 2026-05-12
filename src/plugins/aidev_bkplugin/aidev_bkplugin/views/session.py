@@ -10,6 +10,7 @@ from rest_framework.views import Response
 
 from aidev_bkplugin.constants import AGUI_PROTOCOL_VERSION
 from aidev_bkplugin.services.agent_config import AgentConfigFetcher
+from aidev_bkplugin.services.agent_session import SessionManager
 from aidev_bkplugin.utils import is_local_dev
 from aidev_bkplugin.views.base import PluginResourceManager, PluginViewSet, client, logger
 
@@ -54,21 +55,26 @@ class ChatSessionViewSet(PluginViewSet):
         parser_classes=[FileUploadParser],
     )
     def upload(self, request, pk, file_name, **kwargs):
-        if not request.data.get("file", None):
+
+        file_obj = request.data.get("file", None)
+        if not file_obj:
             raise ClientBlueException(message="file is required")
+
+        file_content = file_obj.read()
+
+        SessionManager(request.user.username).add_file_to_store(pk, file_name, file_content)
+
         _data = dict(
             path_params={"session_code": pk, "file_name": file_name},
-            data=request.data.get("file", None).read(),
+            data=file_content,
             keep_data=True,
             headers={
                 "Content-Type": "application/octet-stream",
                 "Content-Disposition": f'attachment; filename="{file_name}"',
             },
         )
-        logger.info(f"upload_chat_session_file data: {_data}")
-        result = client.api.upload_chat_session_file(
-            **_data,
-        )
+
+        result = client.api.upload_chat_session_file(**_data)
         return Response(data=result["data"])
 
     def destroy(self, request, pk, **kwargs):

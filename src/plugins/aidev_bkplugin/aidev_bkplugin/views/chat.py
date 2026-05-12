@@ -36,6 +36,7 @@ class ChatCompletionViewSet(PluginViewSet):
         username = self.get_username()
         session_code = ""  # 给异常分支兜底，避免 except 段引用未定义变量
         event_handler = None  # 用于断点续传
+        session_manager = SessionManager(username=username)
 
         try:
             serializer = ChatCompletionRequestSerializer(
@@ -60,7 +61,7 @@ class ChatCompletionViewSet(PluginViewSet):
                 # 但未传 session_code 时触发；_handle_flow_agent 只接受 session_code。
                 if thread_id and not session_code:
                     try:
-                        session_code = SessionManager(username=username).get_or_create_by_thread_id(thread_id)
+                        session_code = session_manager.get_or_create_by_thread_id(thread_id)
                         execute_kwargs.session_code = session_code
                         logger.info(
                             "[FLOW_AGENT] Resolved session_code from thread_id: thread_id=%s, session_code=%s",
@@ -137,6 +138,10 @@ class ChatCompletionViewSet(PluginViewSet):
                     },
                 )
             raise ClientBlueException(message=message)
+        finally:
+            if session_code:
+                logger.info(f"clear session file_store: session_code={session_code}")
+                session_manager.clear_session_file_store(session_code)
 
     def _handle_thread_id_mode_with_chat_history(
         self,

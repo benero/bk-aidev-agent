@@ -17,6 +17,7 @@ from aidev_agent.packages.resource_manager import resource_manager
 from aidev_agent.pydantic_models import ChatPrompt
 from bkapi_client_core.exceptions import HTTPResponseError
 from django.conf import settings
+from langchain_core.stores import ByteStore, InMemoryByteStore
 
 from ..constants import AGUI_PROTOCOL_VERSION
 
@@ -29,6 +30,8 @@ class SessionManager:
     所有 HTTP 调用经由 ``resource_manager().get_client()``，业务侧 import 上不再耦合
     ``BKAidevApi``；用户名通过 ``X-BKAIDEV-USER`` header 透传给后端识别用户。
     """
+
+    _shared_session_file_stores: dict[tuple[str, str, str], ByteStore] = {}
 
     def __init__(self, username: str, agent_code: str | None = None):
         self.username = username
@@ -106,3 +109,19 @@ class SessionManager:
 
         if content:
             self.save_content(session_code=session_code, role=PromptRole.AI.value, content=content)
+
+    def _file_store_key(self, session_code: str) -> tuple[str, str, str]:
+        return (self.username, self.agent_code, session_code)
+
+    def get_session_file_store(self, session_code: str) -> ByteStore:
+        key = self._file_store_key(session_code)
+        if key not in self._shared_session_file_stores:
+            self._shared_session_file_stores[key] = InMemoryByteStore()
+        return self._shared_session_file_stores[key]
+
+    def add_file_to_store(self, session_code: str, file_name: str, content: bytes) -> None:
+        store = self.get_session_file_store(session_code)
+        store.mset([(file_name, content)])
+
+    def clear_session_file_store(self, session_code: str) -> None:
+        self._shared_session_file_stores.pop(self._file_store_key(session_code), None)

@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import pytz
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -32,6 +33,7 @@ from aidev_agent.core.ag_ui.types import ActivityMessage
 from aidev_agent.enums import ContextType
 from aidev_agent.packages.langchain_core.models.utils import is_deepseek_r1_series_models
 from aidev_agent.packages.langchain_core.tools.render import render_text_description_and_args
+from aidev_agent.core.tools.add_image_to_chat_context import get_runtime_user_store, list_runtime_file_names
 
 from .pydantic_models import DEFAULT_ENABLE_PARALLEL_TOOL_CALLS, NextFunction, ProcessorContext
 
@@ -45,16 +47,16 @@ logger = logging.getLogger(__name__)
 # NOTE: Keep content aligned with graphs/react/prompts.py::MULTI_MODAL_PREFIX to
 # preserve backwards-compatible default behavior when `ModelNodeSettings.prefix`
 # is not provided.
-DEFAULT_MULTI_MODAL_PREFIX = """You are a professional assistant, 
+DEFAULT_MULTI_MODAL_PREFIX = """You are a professional assistant,
 respond to the human as helpfully,accurately,concisely as possible.
 
-User who you are serving, already upload some documents and images already. 
+User who you are serving, already upload some documents and images already.
 The uploaded file list are:
 ```
 {files_list}.
 ```
 
-The documents also already split and store into a knowledgebase. 
+The documents also already split and store into a knowledgebase.
 An knowledgebase retriever is used to retrieve the document parts in natural language query.
 
 If the theme what user talk about is closely related to the document type file name, follow the principles below:
@@ -66,24 +68,24 @@ If the theme what user talk about is closely related to the document type file n
 - When using knowledgebase retriever, limit the search to a specific file name unless the user specifies otherwise.
 
 If the theme what user talk about is closely related to the uploaded images, or user ask questions intermediately after upload images
-never forget to use `add_image_to_chat_context` tool to add images content to chat context, 
+never forget to use `add_image_to_chat_context` tool to add images content to chat context,
 if you already added same image before, never add it again.
 Only use `add_image_to_chat_context` tool to get information from image files.
 
-!!! If you are generating some python code, and you need to `import` some module in that code, 
+!!! If you are generating some python code, and you need to `import` some module in that code,
 MAKE SURE to use this format `globals()['module'] = __import__('module')` instead of `import module`. !!!
 
 Follow the common principles below:
 
 - If you can't get the information you need using tools, simply say you can't complete the requirement.
  if you already get the information you need using the tools, return Final Answer as soon as possible.
-- When you plan to answer the question, 
- check whether the theme what user talk about is closely related with the document type file name first, 
- ONLY if closely related, use tools to get the content, 
- OTHERWISE never to get the content or use other tools or provide the answer directly. 
+- When you plan to answer the question,
+ check whether the theme what user talk about is closely related with the document type file name first,
+ ONLY if closely related, use tools to get the content,
+ OTHERWISE never to get the content or use other tools or provide the answer directly.
 - Make sure the language of the Final Answer is Chinese.
-- !!! The information what you get may be irrelevant to the the requirements, remove them in Final Answer, 
-    or just say I dont't know NEVER return irrelevant information in Final Answer.!!! 
+- !!! The information what you get may be irrelevant to the the requirements, remove them in Final Answer,
+    or just say I dont't know NEVER return irrelevant information in Final Answer.!!!
 - !!! Never use same tool with same parameters multi times continuously. !!!
 - If you got error from tools, try to fix it based on the error, but don't retry too much times (at most 2 times).
 - !!! You MUST offer the error info if tool's error can not be handled !!!"""
@@ -373,4 +375,54 @@ class DeepSeekR1VariablesMiddleware:
             if isinstance(history_system_prompt, str) and history_system_prompt.strip():
                 chat_history.insert(0, HumanMessage(content=history_system_prompt))
                 ctx.variables["history_system_prompt"] = ""
+        next()
+
+
+class RuntimeUserStoreVariablesMiddleware:
+    def __call__(self, ctx: ProcessorContext, next: NextFunction) -> None:
+        if ctx.store is None:
+            ctx.variables.setdefault("files_list", "")
+            next()
+            return
+
+        user_store = get_runtime_user_store(ctx.store)
+        file_names = list_runtime_file_names(user_store)
+        ctx.variables["files_list"] = ", ".join(file_names)
+
+        images = cast(dict[str, str], user_store.get("image") or {})
+        if not images:
+            next()
+            return
+
+        image_contents = []
+        for file_name, base64_data in images.items():
+            mime_type, _ = mimetypes.guess_type(file_name)
+            image_contents.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type or 'image/png'};base64,{base64_data}"
+                    },
+                }
+            )
+
+        query = ctx.variables.get("query", "")
+        if isinstance(query, str):
+            multimodal_query = []
+            if query.strip():
+                multimodal_query.append({"type": "text", "text": query})
+            multimodal_query.extend(image_contents)
+            ctx.variables["query"] = multimodal_query
+        elif isinstance(query, list):
+            existed_urls = {
+                item.get("image_url", {}).get("url")
+                for item in query
+                if isinstance(item, dict) and item.get("type") == "image_url"
+            }
+            for item in image_contents:
+                url = item["image_url"]["url"]
+                if url not in existed_urls:
+                    query.append(item)
+            ctx.variables["query"] = query
+
         next()

@@ -22,6 +22,7 @@ from aidev_agent.utils.factory import SimpleFactory
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
+    from langchain_core.stores import ByteStore
 
     from aidev_agent.packages.resource_manager import ResourceManagerProtocol
     from aidev_agent.pydantic_models import AgentConfig
@@ -42,6 +43,8 @@ class ChatBuildExtras:
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     checkpointer: Optional["BaseCheckpointSaver"] = None
+    support_vision: Optional[bool] = False
+    file_store: Optional["ByteStore"] = None
 
 
 @dataclass

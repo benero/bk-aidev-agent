@@ -98,6 +98,7 @@ class AgentBuilder:
         event_handler = AGUISessionWriter(
             session_code=session_code, client=AgentHelper.get_client(), username=self.username
         )
+        file_store = self.session_manager.get_session_file_store(session_code)
         return AgentInstanceFactory.build_agent(
             build_type=AgentBuildType.SESSION,
             session_code=session_code,
@@ -106,4 +107,6 @@ class AgentBuilder:
             event_handler=event_handler,
             username=self.username,
             version=version,
+            file_store=file_store,
+            support_vision=AgentConfigFetcher.get_info(username=self.username).get("prompt_setting", {}).get("support_upload", {}).get("vision", False)
         )

@@ -20,15 +20,33 @@ import functools
 from base64 import b64encode
 from pathlib import PosixPath
 from random import randint
-from typing import List, cast
+from typing import List, cast, Annotated
 
 from langchain_core.stores import ByteStore
 from langchain_core.tools import StructuredTool, ToolException
+from langgraph.prebuilt import InjectedStore
+from langgraph.store.base import BaseStore
 
 from aidev_agent.packages.langchain_core.tools.exceptions import TooMuchToolException
 from aidev_agent.utils.local import request_local
 
 IMAGE_SUFFIXES = ("jpg", "jpeg", "png", "gif")
+RUNTIME_USER_STORE_NS = ("runtime_user_store",)
+RUNTIME_USER_STORE_KEY = "current_user_store"
+
+
+def get_runtime_user_store(store: BaseStore) -> dict:
+    item = store.get(RUNTIME_USER_STORE_NS, RUNTIME_USER_STORE_KEY)
+    return item.value if item else {}
+
+def set_runtime_user_store(store: BaseStore, value: dict) -> None:
+    store.put(RUNTIME_USER_STORE_NS, RUNTIME_USER_STORE_KEY, value)
+
+def list_runtime_file_names(user_store: dict) -> list[str]:
+    file_store = cast(ByteStore | None, user_store.get("file_store"))
+    if file_store is None or not hasattr(file_store, "yield_keys"):
+        return []
+    return [str(key) for key in file_store.yield_keys()]
 
 
 def exception_to_tool_exception(func):
@@ -65,21 +83,32 @@ class ToolErrorHandler:
 
 
 @exception_to_tool_exception
-def _add_image_to_chat_context(file_names: List[str]) -> str:
-    user_store = getattr(request_local, "current_user_store", {})
-    file_store = cast(ByteStore, user_store.get("file_store"))
+def _add_image_to_chat_context(
+    file_names: List[str],
+    store: Annotated[BaseStore, InjectedStore()],
+) -> str:
+    item = store.get(RUNTIME_USER_STORE_NS, RUNTIME_USER_STORE_KEY)
+    user_store = item.value if item else {}
+
+    file_store = cast(ByteStore | None, user_store.get("file_store"))
+    if file_store is None:
+        return "No file store"
+
     content = file_store.mget(file_names)
     if not content:
         return "No image"
+
     user_store["image"] = {
         file_names[n]: b64encode(c).decode()
         for n, c in enumerate(content)
-        if PosixPath(file_names[n]).suffix[1:] in IMAGE_SUFFIXES
+        if c and PosixPath(file_names[n]).suffix[1:] in IMAGE_SUFFIXES
     }
-    setattr(request_local, "current_user_store", user_store)
+
+    store.put(RUNTIME_USER_STORE_NS, RUNTIME_USER_STORE_KEY, user_store)
+
     return (
-        f"Image {file_names} has been already added to the context. Never add it again. Please based on the image for"
-        " reference."
+        f"Image {file_names} has been already added to the context. "
+        "Never add it again. Please based on the image for reference."
     )
 
 

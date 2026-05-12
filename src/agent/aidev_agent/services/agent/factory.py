@@ -2,6 +2,7 @@ import logging
 from typing import Any, Callable, List, Optional, cast
 
 from ag_ui.core import BaseEvent
+from langchain_core.stores import ByteStore
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -62,6 +63,8 @@ class AgentInstanceFactory:
         checkpointer: BaseCheckpointSaver | None = None,
         username: str | None = None,
         version: Optional[str] = None,
+        support_vision: bool = True,
+        file_store: ByteStore | None = None,
         *,
         _token: object = None,
     ):
@@ -355,6 +358,8 @@ class AgentInstanceFactory:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 checkpointer=self.checkpointer,
+                support_vision=remaining_extra.pop("support_vision", None),
+                file_store=remaining_extra.pop("file_store", None),
             )
         elif self.agent_type == AgentType.FLOW:
             # FLOW 路径不依赖 agent 配置（与原行为保持一致），跳过预读
