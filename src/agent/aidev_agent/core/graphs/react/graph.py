@@ -561,7 +561,9 @@ class ReActAgentBuilder:
             tools.extend(extra_tools or [])
         # 加载图片工具
         if support_vision:
-            tools.append(add_image_to_chat_context)
+            # tools.append(add_image_to_chat_context)
+            # 不再通过工具进行base64转换
+            pass
         # 加载由中间间导入的工具
         middleware_tools = [t for m in langchain_middleware for t in getattr(m, "tools", [])]
         tools.extend(middleware_tools)

@@ -71,7 +71,7 @@ class ChatCompletionAgent(BaseModel):
         default=None, exclude=True, description="per-request 资源管理器（含正确 app_code / access_token）"
     )
 
-    IMAGE_FILE_PATTERN: ClassVar[re.Pattern] = re.compile(r"^\!\[.*\]\((http[^)]+/([^/]+?)\))")
+    IMAGE_FILE_PATTERN: ClassVar[re.Pattern] = re.compile(r"^!\[.*\]\((http[^)]+/([^/]+?))\)")
     TOOL_EXECUTION_INTERVAL: ClassVar[int] = 10
     UPLOAD_IMAGE_PROMPT_PREFIX: ClassVar[Any] = "我上传了个图片文件,文件名为{file_name}。"
     SKIP_PROMPT_ROLE: ClassVar[list[str]] = ["guide", "reasoning"]
@@ -302,13 +302,45 @@ class ChatCompletionAgent(BaseModel):
                         new_content = []
                         for each_content in each.content:
                             if each_content.get("url"):
-                                new_content.append({"type": "image_url", "image_url": {"url": each_content.get("url")}})
+                                new_content.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": each_content.get("url")}
+                                })
                             else:
                                 new_content.append(each_content)
-                        each.content = new_content
-                        messages.append(HumanMessage(id=each.id, content=each.content))
+
+                        content = new_content
                     else:
-                        messages.append(HumanMessage(id=each.id, content=str(each.content)))
+                        content = str(each.content)
+
+                    # ===== 新增：合并连续 HumanMessage =====
+                    if messages and isinstance(messages[-1], HumanMessage):
+                        prev_content = messages[-1].content
+
+                        # list + list
+                        if isinstance(prev_content, list) and isinstance(content, list):
+                            prev_content.extend(content)
+
+                        # str + str
+                        elif isinstance(prev_content, str) and isinstance(content, str):
+                            messages[-1].content = prev_content + "\n" + content
+
+                        # str + list
+                        elif isinstance(prev_content, str) and isinstance(content, list):
+                            messages[-1].content = [
+                                {"type": "text", "text": prev_content},
+                                *content,
+                            ]
+
+                        # list + str
+                        elif isinstance(prev_content, list) and isinstance(content, str):
+                            prev_content.append({
+                                "type": "text",
+                                "text": content,
+                            })
+
+                    else:
+                        messages.append(HumanMessage(id=each.id, content=content))
                 case PromptRole.ASSISTANT.value | PromptRole.AI.value:
                     tool_calls = self._extract_tool_calls(bp)
                     messages.append(AIMessage(id=each.id, content=each.content, tool_calls=tool_calls))
@@ -359,8 +391,8 @@ class ChatCompletionAgent(BaseModel):
                 each.role = PromptRole.USER.value
                 match = self.IMAGE_FILE_PATTERN.search(each.content)
                 if match:
-                    file_path = match.group(2)
-                    each.content = self.UPLOAD_IMAGE_PROMPT_PREFIX.format(file_name=file_path)
+                    file_path, file_name = match.group(1), match.group(2)
+                    each.content = [{"file_name": file_name, "mime_type": "image/png", "type": "binary", "url": file_path}]
                     # 图片不计算实际大小，但不能为 0 —— 给一个大于 0 的占位值
                     self.files.append({"file_name": file_path, "file_size": 100})
                 else:
