@@ -2,6 +2,7 @@ import logging
 from typing import Any, Callable, List, Optional, cast
 
 from ag_ui.core import BaseEvent
+from blueapps.utils.request_provider import get_local_request_id
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -17,6 +18,7 @@ from aidev_agent.services.agent.registry import (
     agent_registry,
 )
 from aidev_agent.services.common_agent import CommonAgentProtocol, common_agent_factory
+from aidev_agent.services.token_usage import BKAidevTokenUsageSink, TokenUsageCallbackHandler
 
 logger = logging.getLogger("aidev-agent")
 
@@ -201,6 +203,31 @@ class AgentInstanceFactory:
         version = self.version if agent_code == self.agent_code else None
         return self.resource_manager.get_agent_config(agent_code=agent_code, version=version)
 
+    def _build_token_usage_callback(
+        self,
+        *,
+        session_code: str | None,
+        agent_code: str,
+        llm_code: str,
+        channel_type: str | None,
+    ):
+        if not session_code:
+            return None
+
+        metadata = {
+            "session_code": session_code,
+            "agent_code": agent_code,
+            "agent_version": self.version or "",
+            "channel_type": channel_type or "",
+            "request_id": get_local_request_id(),
+            "llm_code": llm_code,
+            "created_by": self.username,
+        }
+        return TokenUsageCallbackHandler(
+            sink=BKAidevTokenUsageSink(resource_manager=self.resource_manager, username=self.username),
+            metadata=metadata,
+        )
+
     # ============== 内部方法 ==============
 
     def _validate_params(self):
@@ -347,9 +374,18 @@ class AgentInstanceFactory:
         if self.agent_type == AgentType.CHAT:
             # CHAT 路径必读主配置（下游 ChatAgentBuilder 大量依赖）
             agent_config = self.get_agent_config(final_agent_code)
+            callbacks = list(self.callbacks)
+            token_usage_cb = self._build_token_usage_callback(
+                session_code=self.session_code,
+                agent_code=final_agent_code,
+                llm_code=agent_config.chat_model,
+                channel_type=remaining_extra.get("channel_type"),
+            )
+            if token_usage_cb is not None:
+                callbacks.append(token_usage_cb)
             chat_extras = ChatBuildExtras(
                 agent_cls=self.agent_cls if self.agent_cls is not None else common_agent_factory.get(),
-                callbacks=list(self.callbacks),
+                callbacks=callbacks,
                 auth_headers=self.auth_headers,
                 default_headers=self.default_headers,
                 temperature=self.temperature,
