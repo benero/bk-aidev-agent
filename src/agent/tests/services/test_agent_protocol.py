@@ -27,8 +27,11 @@ from aidev_agent.services.agent import (
     agent_registry,
 )
 from aidev_agent.services.agent.chat import ChatAgentBuilder
+from aidev_agent.services.agent.factory import _FACTORY_TOKEN
 from aidev_agent.services.common_agent import CommonQAAgent
+from aidev_agent.services.token_usage import TokenUsageCallbackHandler
 from aidev_agent.utils.factory import SimpleFactory
+from aidev_agent.utils.local import request_local
 from langgraph.checkpoint.memory import MemorySaver
 
 
@@ -334,3 +337,46 @@ class TestFactoryEndToEnd:
         assert agent.poll_timeout == 2.0
         assert agent.resource_manager is flow_rm
         assert agent.username == "bob"
+
+    def test_make_build_context_appends_token_usage_callback_with_channel_type(self):
+        resource_manager = MagicMock(name="rm")
+        resource_manager.get_agent_config.return_value = _make_agent_config("agent-x", chat_model="qwen-plus")
+
+        request_local.request_id = "req-123"
+        factory = AgentInstanceFactory(
+            agent_code="agent-x",
+            agent_type=AgentType.CHAT,
+            build_type=AgentBuildType.SESSION,
+            session_code="session-1",
+            callbacks=[MagicMock(name="existing_cb")],
+            resource_manager=resource_manager,
+            checkpointer=MemorySaver(),
+            username="alice",
+            version="v2",
+            _token=_FACTORY_TOKEN,
+        )
+
+        try:
+            ctx = factory._make_build_context(
+                {
+                    "agent_code": "agent-x",
+                    "session_context_data": [],
+                    "switch_agent": False,
+                },
+                None,
+                {"channel_type": "popup"},
+            )
+        finally:
+            if hasattr(request_local, "request_id"):
+                delattr(request_local, "request_id")
+
+        assert ctx.chat is not None
+        assert len(ctx.chat.callbacks) == 2
+        callback = next(cb for cb in ctx.chat.callbacks if isinstance(cb, TokenUsageCallbackHandler))
+        assert callback._metadata["session_code"] == "session-1"
+        assert callback._metadata["agent_code"] == "agent-x"
+        assert callback._metadata["agent_version"] == "v2"
+        assert callback._metadata["channel_type"] == "popup"
+        assert callback._metadata["request_id"] == "req-123"
+        assert callback._metadata["llm_code"] == "qwen-plus"
+        assert callback._metadata["created_by"] == "alice"
