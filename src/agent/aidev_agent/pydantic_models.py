@@ -21,6 +21,7 @@ class ExecuteKwargs(BaseModel):
     caller_bk_biz_env: str | None = Field(default=None, description="调用者BK业务环境")
     caller_bk_biz_id: int | None = Field(default=None, description="调用者BK业务ID")
     caller_executor: str | None = Field(default=None, description="调用人")
+    channel_type: str | None = Field(default=None, description="调用渠道")
     caller_order_type: str | None = Field(default=None, description="调用AI工单类型")
     caller_trace_context: Dict[str, Any] | None = Field(default=None, description="调用链ID")
     thread_id: str | None = Field(default=None, description="Thread ID，用于APIGW调用时自动管理会话")

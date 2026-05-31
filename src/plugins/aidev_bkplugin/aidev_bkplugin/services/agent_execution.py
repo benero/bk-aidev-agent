@@ -41,6 +41,7 @@ def build_execute_kwargs(_execute_kwargs: dict, username: str | None = None) -> 
     execute_kwargs.caller_bk_app_code = execute_kwargs.caller_bk_app_code or "bkaidev"
     execute_kwargs.executor = execute_kwargs.executor or username or "anonymous"
     execute_kwargs.caller_executor = execute_kwargs.caller_executor or username or "anonymous"
+    execute_kwargs.channel_type = execute_kwargs.channel_type or "API"
     execute_kwargs.caller_order_type = execute_kwargs.caller_order_type or "ai_chat"
     if not execute_kwargs.caller_trace_context and trace is not None:
         current_span = trace.get_current_span()
@@ -50,6 +51,11 @@ def build_execute_kwargs(_execute_kwargs: dict, username: str | None = None) -> 
             propagator.inject(carrier, context=trace.set_span_in_context(current_span))
             execute_kwargs.caller_trace_context = carrier
     return execute_kwargs
+
+
+def _resolve_channel_type(execute_kwargs: ExecuteKwargs | object) -> str:
+    channel_type = getattr(execute_kwargs, "channel_type", None)
+    return channel_type if isinstance(channel_type, str) and channel_type else "API"
 
 
 class AgentExecutor:
@@ -231,6 +237,7 @@ class AgentExecutor:
             thread_id=execute_kwargs.session_code or str(uuid.uuid4()),
             chat_history=chat_history,
             version=execute_kwargs.version,
+            channel_type=_resolve_channel_type(execute_kwargs),
         )
         return agent_instance.execute(execute_kwargs)
 
@@ -256,6 +263,7 @@ class AgentExecutor:
             input_text=input_text,
             save_content=save_content,
             version=execute_kwargs.version,
+            channel_type=_resolve_channel_type(execute_kwargs),
         )
         execute_kwargs.session_code = session_code
         result = cls(builder.session_manager).execute_with_save(
