@@ -93,6 +93,7 @@ class ChatCompletionViewSet(PluginViewSet):
             agent_instance = AgentBuilder(username=request.user.username).by_session_code(
                 session_code,
                 version=execute_kwargs.version,
+                channel_type=execute_kwargs.channel_type,
             )
             if _input:
                 # 处理 chat_history 为 None 或空列表的情况（如编辑第一条消息时）
@@ -153,6 +154,7 @@ class ChatCompletionViewSet(PluginViewSet):
             thread_id=thread_id,
             chat_history=chat_history,
             version=execute_kwargs.version,
+            channel_type=execute_kwargs.channel_type,
         )
         execute_kwargs.session_code = session_code
         result = AgentExecutor(builder.session_manager).execute_with_save(
