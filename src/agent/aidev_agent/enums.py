@@ -106,6 +106,14 @@ class AgentType(enum.Enum):
     FLOW = "flow"
 
 
+class ChannelType(str, enum.Enum):
+    """调用渠道类型"""
+
+    API = "api"
+    CHATBOX = "chatbox"
+    BK_PLUGIN = "bk_plugin"
+
+
 class SessionsStatus(enum.Enum):
     """会话状态（断点续传）"""
 

@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 from aidev_bkplugin.packages.apigw.permissions import ApigwPermission
 from aidev_bkplugin.permissions import AgentPluginPermission
+from aidev_agent.enums import ChannelType
 from aidev_bkplugin.services.agent_helpers import AgentHelper
 from aidev_bkplugin.views.agent import AgentInfoViewSet
 from aidev_bkplugin.views.base import PluginViewSet
@@ -44,7 +45,9 @@ class OpenapiPluginViewSet(PluginViewSet):
 
 
 class OpenapiChatCompletionViewSet(OpenapiPluginViewSet, ChatCompletionViewSet):
-    pass
+    @property
+    def channel_type(self):
+        return ChannelType.API.value
 
 
 class OpenapiAgentAbilitiesViewSet(OpenapiPluginViewSet):

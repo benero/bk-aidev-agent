@@ -78,7 +78,7 @@ class ChatAgentStrategy:
     ) -> None:
         start_time = time.time()
         execute_kwargs = build_execute_kwargs(
-            {"stream": True, "thread_id": thread_id, "executor": username, "group_id": group_id, "channel_type": "rtx"},
+            {"stream": True, "thread_id": thread_id, "executor": username, "group_id": group_id},
             username,
         )
         result, session_code = AgentExecutor.run_chat_completion_with_thread_id(
