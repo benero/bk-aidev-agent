@@ -110,8 +110,8 @@ class ChannelType(str, enum.Enum):
     """调用渠道类型"""
 
     API = "api"
-    CHATBOX = "chatbox"
-    BK_PLUGIN = "bk_plugin"
+    POPUP = "popup"
+    BKPLUGIN = "bkplugin"
 
 
 class SessionsStatus(enum.Enum):
