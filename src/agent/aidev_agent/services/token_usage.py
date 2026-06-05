@@ -42,47 +42,6 @@ class BKAidevTokenUsageSink(TokenUsageSink):
             logger.exception("failed to report token usage: payload=%s", payload)
 
 
-def _normalize_token_usage(response: LLMResult) -> dict[str, int] | None:
-    usage = None
-    if response.llm_output:
-        for key in ("token_usage", "usage"):
-            if key in response.llm_output and response.llm_output[key]:
-                usage = response.llm_output[key]
-                break
-
-    if usage is None and response.generations:
-        for generation_group in reversed(response.generations):
-            for generation in reversed(generation_group):
-                message = getattr(generation, "message", None)
-                usage = getattr(message, "usage_metadata", None)
-                if usage:
-                    break
-            if usage:
-                break
-
-    if usage is None:
-        return None
-
-    if hasattr(usage, "to_dict_recursive"):
-        usage = usage.to_dict_recursive()
-    elif hasattr(usage, "model_dump"):
-        usage = usage.model_dump()
-    elif hasattr(usage, "dict"):
-        usage = usage.dict()
-
-    if not isinstance(usage, dict):
-        return None
-
-    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-    output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-    }
-
-
 class TokenUsageCallbackHandler(BaseCallbackHandler):
     """Collect token usage from LLM results and forward it to a sink."""
 
@@ -91,8 +50,68 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
         self._sink = sink
         self._metadata = metadata or {}
 
+    @classmethod
+    def _normalize_token_usage(cls, response: LLMResult) -> dict[str, int] | None:
+        usage = cls._get_raw_usage(response)
+        if usage is None:
+            return None
+
+        usage_dict = cls._coerce_usage_dict(usage)
+        if usage_dict is None:
+            return None
+
+        input_tokens = int(usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens") or 0)
+        output_tokens = int(usage_dict.get("completion_tokens") or usage_dict.get("output_tokens") or 0)
+        total_tokens = int(usage_dict.get("total_tokens") or input_tokens + output_tokens)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @classmethod
+    def _get_raw_usage(cls, response: LLMResult) -> Any | None:
+        usage = cls._get_usage_from_llm_output(response.llm_output or {})
+        if usage is not None:
+            return usage
+
+        return cls._get_usage_from_generations(response.generations or [])
+
+    @staticmethod
+    def _get_usage_from_llm_output(llm_output: dict[str, Any]) -> Any | None:
+        return next((llm_output[key] for key in ("token_usage", "usage") if llm_output.get(key)), None)
+
+    @classmethod
+    def _get_usage_from_generations(cls, generation_groups: list[list[Any]]) -> Any | None:
+        for generation_group in reversed(generation_groups):
+            usage = cls._get_usage_from_generation_group(generation_group)
+            if usage is not None:
+                return usage
+        return None
+
+    @staticmethod
+    def _get_usage_from_generation_group(generation_group: list[Any]) -> Any | None:
+        for generation in reversed(generation_group):
+            message = getattr(generation, "message", None)
+            usage = getattr(message, "usage_metadata", None)
+            if usage is not None:
+                return usage
+        return None
+
+    @staticmethod
+    def _coerce_usage_dict(usage: Any) -> dict[str, Any] | None:
+        for method_name in ("to_dict_recursive", "model_dump", "dict"):
+            if hasattr(usage, method_name):
+                usage = getattr(usage, method_name)()
+                break
+
+        if not isinstance(usage, dict):
+            return None
+
+        return usage
+
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
-        usage = _normalize_token_usage(response)
+        usage = self._normalize_token_usage(response)
         if not usage:
             return
 
