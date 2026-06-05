@@ -231,7 +231,7 @@ class AgentExecutor:
             thread_id=execute_kwargs.session_code or str(uuid.uuid4()),
             chat_history=chat_history,
             version=execute_kwargs.version,
-            channel_type=ChannelType.BK_PLUGIN.value,
+            channel_type=ChannelType.BKPLUGIN.value,
         )
         return agent_instance.execute(execute_kwargs)
 
