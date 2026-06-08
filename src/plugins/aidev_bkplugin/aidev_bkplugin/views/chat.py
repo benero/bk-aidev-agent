@@ -26,7 +26,7 @@ class ChatCompletionViewSet(PluginViewSet):
 
     @property
     def channel_type(self):
-        return ChannelType.CHATBOX.value
+        return ChannelType.POPUP.value
 
     def create(self, request):
         """
