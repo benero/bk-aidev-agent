@@ -14,7 +14,7 @@ import json
 import uuid
 from logging import getLogger
 
-from aidev_agent.enums import ChatContentStatus, PromptRole, StreamEventType
+from aidev_agent.enums import ChannelType, ChatContentStatus, PromptRole, StreamEventType
 from aidev_agent.pydantic_models import ChatPrompt, ExecuteKwargs
 from aidev_agent.services.agent import ChatCompletionAgent
 
@@ -231,6 +231,7 @@ class AgentExecutor:
             thread_id=execute_kwargs.session_code or str(uuid.uuid4()),
             chat_history=chat_history,
             version=execute_kwargs.version,
+            channel_type=ChannelType.BKPLUGIN.value,
         )
         return agent_instance.execute(execute_kwargs)
 
@@ -241,6 +242,7 @@ class AgentExecutor:
         input_text: str,
         username: str,
         execute_kwargs: ExecuteKwargs,
+        channel_type: str,
         save_content: bool = True,
     ):
         """通过 ``thread_id`` 统一执行 ChatCompletion 并自动处理会话保存。
@@ -256,6 +258,7 @@ class AgentExecutor:
             input_text=input_text,
             save_content=save_content,
             version=execute_kwargs.version,
+            channel_type=channel_type,
         )
         execute_kwargs.session_code = session_code
         result = cls(builder.session_manager).execute_with_save(

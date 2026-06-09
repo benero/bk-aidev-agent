@@ -3,7 +3,7 @@
 import uuid
 
 from aidev_agent.config import settings as agent_settings
-from aidev_agent.enums import AgentBuildType, AgentType, PromptRole
+from aidev_agent.enums import AgentBuildType, AgentType, ChannelType, PromptRole
 from aidev_agent.pydantic_models import ChatPrompt, ExecuteKwargs
 from aidev_agent.services.agent import AgentInstanceFactory
 from aidev_agent.services.event_handlers.agui_writer import AGUISessionWriter
@@ -23,6 +23,10 @@ from aidev_bkplugin.views.base import IgnoreClientContentNegotiation, PluginReso
 class ChatCompletionViewSet(PluginViewSet):
     # 使用自定义内容协商，忽略 Accept 头限制，支持流式响应
     content_negotiation_class = IgnoreClientContentNegotiation
+
+    @property
+    def channel_type(self):
+        return ChannelType.POPUP.value
 
     def create(self, request):
         """
@@ -83,6 +87,7 @@ class ChatCompletionViewSet(PluginViewSet):
                     chat_history=chat_history,
                     username=username,
                     execute_kwargs=execute_kwargs,
+                    channel_type=self.channel_type,
                 )
 
             # 走到这里 thread_id 必为空（上面已 return）；由 serializer 中的 uuid 兜底规则可推出
@@ -93,6 +98,7 @@ class ChatCompletionViewSet(PluginViewSet):
             agent_instance = AgentBuilder(username=request.user.username).by_session_code(
                 session_code,
                 version=execute_kwargs.version,
+                channel_type=self.channel_type,
             )
             if _input:
                 # 处理 chat_history 为 None 或空列表的情况（如编辑第一条消息时）
@@ -144,6 +150,7 @@ class ChatCompletionViewSet(PluginViewSet):
         chat_history: list[ChatPrompt],
         username: str,
         execute_kwargs: ExecuteKwargs,
+        channel_type: str,
     ):
         """
         通过 thread_id 自动管理会话，使用 chat_history 初始化，自动保存到 session
@@ -153,6 +160,7 @@ class ChatCompletionViewSet(PluginViewSet):
             thread_id=thread_id,
             chat_history=chat_history,
             version=execute_kwargs.version,
+            channel_type=channel_type,
         )
         execute_kwargs.session_code = session_code
         result = AgentExecutor(builder.session_manager).execute_with_save(

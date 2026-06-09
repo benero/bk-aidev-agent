@@ -112,6 +112,13 @@ class OpenApiGroup(OperationGroup):
         path="/openapi/aidev/resource/v1/chat/session_content/",
     )
 
+    create_chat_session_token_usage = bind_property(
+        Operation,
+        name="create_chat_session_token_usage",
+        method="POST",
+        path="/openapi/aidev/resource/v1/chat/session_content/token_usage/",
+    )
+
     update_chat_session_content = bind_property(
         Operation,
         name="update_chat_session_content ",
