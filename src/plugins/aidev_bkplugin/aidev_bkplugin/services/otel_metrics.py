@@ -91,13 +91,16 @@ class MetricExportSettings:
     def from_agent_info(cls, agent_info: dict[str, Any] | None, *, default_enabled: bool) -> "MetricExportSettings":
         otel_info = (agent_info or {}).get("otel_info") or {}
         metrics_info = otel_info.get("metrics") or {}
-        interval = metrics_info.get(
+        platform_interval = metrics_info.get(
             "export_interval_millis",
             otel_info.get(
                 "metric_export_interval_millis",
-                agent_settings.BKAI_AGENT_METRICS_EXPORT_INTERVAL_MILLIS,
+                DEFAULT_METRIC_EXPORT_INTERVAL_MILLIS,
             ),
         )
+        interval = agent_settings.BKAI_AGENT_METRICS_EXPORT_INTERVAL_MILLIS
+        if interval is None:
+            interval = platform_interval
         timeout = metrics_info.get(
             "export_timeout_millis",
             otel_info.get("metric_export_timeout_millis", 30000),
@@ -140,7 +143,7 @@ class MetricExportSettings:
         )
         return cls(
             enabled=_as_bool(enabled),
-            export_interval_millis=max(1000, int(interval)),
+            export_interval_millis=max(10_000, int(interval)),
             export_timeout_millis=max(1000, int(timeout)),
             task_ttl_seconds=max(1, int(task_ttl_seconds)),
             export_via_celery=_as_bool(export_via_celery),

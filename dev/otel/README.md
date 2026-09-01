@@ -232,9 +232,9 @@ OTel Counter 转成 BKM 的 `*_total`；Histogram 转成累计 `*_bucket`（`le`
 将快照交给 Celery Worker 隔离实际网络请求；`push_mode=direct` 则由周期导出线程直接请求 BKM，
 但不改变快照周期。两种模式都不要求 Worker 读取其他进程内存中的 OTel 聚合器。
 `direct` 模式不经过 Celery 的 TTL 和退避重试，失败后由下一次周期快照继续上报累计值。
-生产默认周期为 10 秒；智能体可通过 `BKAI_AGENT_METRICS_EXPORT_INTERVAL_MILLIS` 调整，平台显式
-下发的 `export_interval_millis` 优先于智能体环境变量，且周期最小为 1 秒。本地 mock 为了缩短
-仪表盘验证等待时间，继续使用 1 秒周期。
+智能体显式配置 `BKAI_AGENT_METRICS_EXPORT_INTERVAL_MILLIS` 时优先使用本地值；未配置时使用平台
+下发的 `export_interval_millis`，两者都未配置则默认为 10 秒，且周期最小为 10 秒。本地 mock 为了
+缩短仪表盘验证等待时间，继续使用 1 秒周期。
 
 本地生成项目默认使用 `BKAI_AGENT_ENABLE_METRICS=false` 强制关闭指标，该显式环境变量的优先级
 高于平台下发的 `otel_info.metrics.enabled`。需要联调 BKM 时改为 `true` 并配置以下参数；平台下发的
