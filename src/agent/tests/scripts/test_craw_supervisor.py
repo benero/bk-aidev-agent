@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -26,6 +27,11 @@ if role == "python":
         (root / "rewritten").touch()
         raise SystemExit(0)
     if sys.argv[1].endswith("apply-agent-config.py"):
+        if os.environ.get("BKAI_CRAW_SKILLS_ONLY") == "1" and os.environ.get("HOLD_SKILLS") == "1":
+            (root / "skill.pid").write_text(str(os.getpid()))
+            (root / "skill.ready").touch()
+            time.sleep(60)
+            raise SystemExit(0)
         Path(os.environ["OPENCLAW_CONFIG_PATH"]).write_text("{}")
         raise SystemExit(0)
     if sys.argv[1] == "bin/manage.py":
@@ -121,6 +127,39 @@ def test_supervisor_fails_closed_and_stops_all_children(runtime, role, stage):
             assert (root / "gunicorn.ready").exists(), output
             assert "application identity egress listener is ready" in output
             assert "MCP egress listener is ready" in output
+        for pid_file in root.glob("*.pid"):
+            with pytest.raises(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), 0)
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=3)
+
+
+@pytest.mark.parametrize("shutdown", ["term", "required_exit"])
+def test_supervisor_stops_slow_optional_skill_sync(runtime, shutdown):
+    root, script, env = runtime
+    env["HOLD_SKILLS"] = "1"
+    proc = subprocess.Popen(
+        ["bash", str(script), str(root / "gunicorn")],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ((root / "gunicorn.ready").exists() and (root / "skill.ready").exists()):
+            assert proc.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        if shutdown == "term":
+            proc.terminate()
+        else:
+            os.kill(int((root / "mcp.pid").read_text()), signal.SIGTERM)
+        output, _ = proc.communicate(timeout=3)
+        assert proc.returncode == (143 if shutdown == "term" else 1), output
         for pid_file in root.glob("*.pid"):
             with pytest.raises(ProcessLookupError):
                 os.kill(int(pid_file.read_text()), 0)

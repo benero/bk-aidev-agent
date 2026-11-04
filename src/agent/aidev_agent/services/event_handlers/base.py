@@ -1447,6 +1447,14 @@ class BaseSessionWriter(ABC):
             tool_call_id: 工具调用 ID，用于匹配延迟记录
             tool_name: 工具名称（续流 fallback 时使用）
         """
+        # 普通工具调用已由ChatModelEnd落库，不属于审批续流重建。
+        # 直接返回避免fallback把当前调用追加到旧assistant，也避免每次全量查询历史。
+        if any(
+            call.get("id") == tool_call_id
+            for properties in self._assistant_builtin_properties.values()
+            for call in properties.get("tool_calls", [])
+        ):
+            return
         matched_assistant_id = None
         matched_tool_call = None
 

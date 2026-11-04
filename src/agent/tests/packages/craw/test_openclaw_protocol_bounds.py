@@ -324,3 +324,44 @@ def test_foreign_chat_terminal_never_triggers_confirmation(monkeypatch, foreign_
     assert [(event.kind, event.text) for event in session.events()] == [("done", "")]
     assert wire.sent == [0.1]  # 两个帧均已读取；外来终态未触发查询。
     assert session.terminated
+
+
+def test_abort_during_event_loop_shortens_deadline_despite_ticks(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(ws_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    session = OpenClawWSSession("ws://localhost", "token", timeout=300)
+    session._run_id = "active"
+    session._run_deadline = 300
+    timeouts = []
+
+    class TickWire:
+        def send(self, text):
+            assert json.loads(text)["method"] == "chat.abort"
+
+        def settimeout(self, value):
+            timeouts.append((now[0], value))
+
+        def recv(self):
+            now[0] += 1
+            if now[0] == 1:
+                assert session.abort("session")
+            return json.dumps({"event": "tick"})
+
+    session._ws = TickWire()
+    assert [event.kind for event in session.events()] == ["error"]
+    assert now[0] == 11
+    assert not session.terminated
+    assert all(timeout <= 11 - started for started, timeout in timeouts if started >= 1)
+
+
+def test_idle_socket_polling_keeps_run_alive_until_absolute_deadline(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(ws_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    session = OpenClawWSSession("ws://localhost", "token", timeout=3)
+    session._run_id = "active"
+    wire = RunWire(session, now, [], [])
+    session._ws = wire
+    assert [event.kind for event in session.events()] == ["error"]
+    assert now[0] == 3
+    assert wire.sent == []
+    assert not session.terminated
