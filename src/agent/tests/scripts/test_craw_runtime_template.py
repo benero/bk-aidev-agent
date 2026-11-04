@@ -79,11 +79,16 @@ def test_openclaw_2026_8_migration_removes_empty_ui(module):
 @pytest.mark.parametrize(
     "current_servers", [{}, {"retained": {"url": "https://mcp.example.test/new", "transport": "streamable_http"}}]
 )
-def test_main_replaces_removed_platform_mcp_and_routes(module, monkeypatch, tmp_path, current_servers):
+@pytest.mark.parametrize("container", ["mcp", "mcpServers", "both"])
+def test_main_replaces_removed_platform_mcp_and_routes(module, monkeypatch, tmp_path, current_servers, container):
     config_path, routes_path = tmp_path / "openclaw.json", tmp_path / "routes.json"
-    config_path.write_text(
-        json.dumps({"mcp": {"servers": {"removed": {"url": "http://127.0.0.1:18787/egress/shared/removed/"}}}})
-    )
+    old_servers = {"removed": {"url": "http://127.0.0.1:18787/egress/shared/removed/"}}
+    old_config = {}
+    if container in {"mcp", "both"}:
+        old_config["mcp"] = {"servers": old_servers}
+    if container in {"mcpServers", "both"}:
+        old_config["mcpServers"] = old_servers
+    config_path.write_text(json.dumps(old_config))
     routes_path.write_text(json.dumps({"removed": "https://mcp.example.test/removed"}))
     for name, value in {
         "BKAI_AGENT": "demo",
@@ -99,7 +104,9 @@ def test_main_replaces_removed_platform_mcp_and_routes(module, monkeypatch, tmp_
     monkeypatch.setattr(module, "AgentResourceManager", lambda: SimpleNamespace(get_agent_config=lambda code: config))
     monkeypatch.setattr(module, "render_soul", lambda config: "soul")
     assert module.main() == 0
-    applied = json.loads(config_path.read_text())["mcp"]["servers"]
+    applied_config = json.loads(config_path.read_text())
+    assert "mcpServers" not in applied_config
+    applied = applied_config["mcp"]["servers"]
     assert set(applied) == set(current_servers)
     if current_servers:
         assert applied["retained"]["transport"] == "streamable-http"

@@ -250,6 +250,7 @@ def main() -> int:
     defaults["skipBootstrap"] = True
     # The platform owns this runtime's MCP list. Replacing it also removes revoked
     # servers before the egress rewrite replaces its route table.
+    openclaw.pop("mcpServers", None)
     mcp_servers = {}
     openclaw.setdefault("mcp", {})["servers"] = mcp_servers
     for mcp_code, mcp_config in (config.mcp_server_config or {}).items():

@@ -86,6 +86,37 @@ def build_openai_messages(session_context_data: list[dict]) -> list[dict]:
     return messages
 
 
+def build_openclaw_history(session_context_data: list[dict]) -> list[dict]:
+    """平台展示账本投影为内核历史；明确未提交的失败轮不属于内核上下文。"""
+    history = []
+    for item in session_context_data:
+        properties = item.get("property") or {}
+        builtin = item.get("builtin_property") or properties.get("builtin_property") or {}
+        if builtin.get("error_code") == "craw_not_submitted":
+            turn_id = builtin.get("turn_id") or properties.get("turn_id")
+            for index in range(len(history) - 1, -1, -1):
+                previous = history[index]
+                if previous.get("role") != "user":
+                    continue
+                previous_properties = previous.get("property") or {}
+                previous_builtin = previous.get("builtin_property") or previous_properties.get("builtin_property") or {}
+                previous_turn = previous_builtin.get("turn_id") or previous_properties.get("turn_id")
+                if not turn_id or previous_turn == turn_id:
+                    del history[index]
+                    break
+            continue
+        message_id = str(builtin.get("message_id") or "")
+        if item.get("role") in {"assistant", "ai"} and (
+            builtin.get("local_notice")
+            or (builtin.get("error") and message_id.startswith("error_"))
+            or (message_id.startswith("paused_") and item.get("content") == "用户已取消")
+        ):
+            # 仅排除 writer 明确生成的本地提示；status=error 的部分回复仍须核对。
+            continue
+        history.append(item)
+    return build_openai_messages(history)
+
+
 class CrawCompletionAgent(BaseModel):
     """把执行委托给 craw 后端的 Chat Agent（注册时覆盖 ``AgentType.CHAT``）。"""
 
@@ -249,8 +280,10 @@ class CrawCompletionAgent(BaseModel):
     def _emit_finish(self, run_id: str) -> Generator[str, None, None]:
         yield emit_run_finished_event(thread_id=self.thread_id, run_id=run_id, event_handler=self._dispatch)
 
-    def _emit_error_and_finish(self, encoder: EventEncoder, run_id: str, message: str) -> Generator[str, None, None]:
-        error_event = RunErrorEvent(type=EventType.RUN_ERROR, message=message)
+    def _emit_error_and_finish(
+        self, encoder: EventEncoder, run_id: str, message: str, *, code: Optional[str] = None
+    ) -> Generator[str, None, None]:
+        error_event = RunErrorEvent(type=EventType.RUN_ERROR, message=message, code=code)
         self._dispatch(error_event)
         yield encoder.encode(error_event)
         yield from self._emit_finish(run_id)
@@ -306,14 +339,14 @@ class CrawCompletionAgent(BaseModel):
         text_open = False
         open_tools: set[str] = set()
         started_at: dict[str, float] = {}
-        session = OpenClawWSSession(ws_url, backend.api_key, timeout=backend.timeout)
+        session = OpenClawWSSession(ws_url, backend.api_key, timeout=backend.timeout, model=backend.model)
         run_started = False
 
         try:
             session.connect()
             self._track_stream(thread, session)
             try:
-                messages = build_openai_messages(self.session_context_data)
+                messages = build_openclaw_history(self.session_context_data)
                 if not messages or messages[-1]["role"] != "user":
                     raise OpenClawWSError("WS 对话必须以本轮用户输入结束")
                 session.verify_history(thread, messages[:-1])
@@ -394,7 +427,7 @@ class CrawCompletionAgent(BaseModel):
                 yield from self._emit_text_end(encoder, message_id)
             yield from self._emit_finish(run_id)
         except OpenClawHistoryError as exc:
-            yield from self._emit_error_and_finish(encoder, run_id, str(exc))
+            yield from self._emit_error_and_finish(encoder, run_id, str(exc), code="craw_not_submitted")
         except OpenClawWSError as exc:
             logger.warning("[CRAW] OpenClaw WS unavailable: %s", exc)
             if text_open:
@@ -403,6 +436,7 @@ class CrawCompletionAgent(BaseModel):
                 encoder,
                 run_id,
                 "连接 OpenClaw 工具事件通道失败，请重试（详情见服务端日志）",
+                code=None if run_started else "craw_not_submitted",
             )
         except Exception as exc:
             logger.exception("[CRAW] OpenClaw WS stream error: %s", exc)
@@ -412,6 +446,7 @@ class CrawCompletionAgent(BaseModel):
                 encoder,
                 run_id,
                 f"转发 craw({backend.name}) 失败: {type(exc).__name__}",
+                code=None if run_started else "craw_not_submitted",
             )
         finally:
             if lease is not None and run_started and not getattr(session, "terminated", False):
