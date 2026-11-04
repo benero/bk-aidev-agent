@@ -5,6 +5,7 @@
   "init_apigw_maintainer": "admin",
   "app_code": "ai-plugin",
   "agent_runtime": "builtin",
+  "agent_config_version": "",
   "extra_fields": {
     "space_id": ""
   },
