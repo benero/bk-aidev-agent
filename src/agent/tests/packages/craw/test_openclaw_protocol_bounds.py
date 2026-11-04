@@ -175,7 +175,8 @@ class RunWire:
     "phases,statuses,kind,terminated",
     [
         (["error"], ["error"], "error", True),
-        (["error"], ["ok"], "done", True),
+        (["error"], ["ok"], "error", True),
+        (["error", "end"], ["ok"], "error", True),
         (["error", "start", "end"], ["timeout", "ok"], "done", True),
         (["error"], ["timeout"], "error", False),
         (["error"], ["unknown"], "error", False),
@@ -218,7 +219,7 @@ def test_ticks_cannot_extend_absolute_deadline(monkeypatch):
     assert all(right >= left + 1 for left, right in zip(sent, sent[1:]))
 
 
-@pytest.mark.parametrize("terminal_status,can_reuse", [("error", True), ("unknown", False)])
+@pytest.mark.parametrize("terminal_status,can_reuse", [("error", True), ("ok", True), ("unknown", False)])
 @pytest.mark.parametrize("terminal_source", ["agent", "chat"])
 def test_confirmed_error_releases_lease_for_next_run(monkeypatch, terminal_status, can_reuse, terminal_source):
     class KernelWire:
@@ -365,3 +366,43 @@ def test_idle_socket_polling_keeps_run_alive_until_absolute_deadline(monkeypatch
     assert now[0] == 3
     assert wire.sent == []
     assert not session.terminated
+
+
+@pytest.mark.parametrize("deltas", [[], ["command ", "response"]])
+def test_chat_final_supplies_command_text_without_repeating_agent_delta(monkeypatch, deltas):
+    now = [0.0]
+    monkeypatch.setattr(ws_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    session = OpenClawWSSession("ws://localhost", "token", timeout=3)
+    session._run_id = "active"
+    wire = RunWire(session, now, [], ["ok"])
+    wire.messages.extend(
+        {"event": "agent", "payload": {"runId": "active", "stream": "assistant", "data": {"delta": text}}}
+        for text in deltas
+    )
+    wire.messages.append(
+        {
+            "event": "chat",
+            "payload": {
+                "runId": "active",
+                "state": "final",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "command response"}]},
+            },
+        }
+    )
+    session._ws = wire
+    events = list(session.events())
+    assert "".join(event.text for event in events if event.kind == "text") == "command response"
+    assert events[-1].kind == "done"
+    assert session.terminated
+
+
+def test_correct_chat_final_replaces_earlier_attempt_error(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(ws_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    session = OpenClawWSSession("ws://localhost", "token", timeout=3)
+    session._run_id = "active"
+    wire = RunWire(session, now, ["error"], ["ok"])
+    wire.messages.append({"event": "chat", "payload": {"runId": "active", "state": "final"}})
+    session._ws = wire
+    assert [event.kind for event in session.events()] == ["done"]
+    assert session.terminated

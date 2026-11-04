@@ -73,6 +73,22 @@ def test_openclaw_2026_8_migration_preserves_supported_ui_settings(module):
     assert config == {"ui": {"prefs": {"theme": "claw"}}}
 
 
+@pytest.mark.parametrize("managed", [True, False])
+def test_failed_skill_refresh_removes_only_platform_managed_copy(module, monkeypatch, tmp_path, managed):
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("old version")
+    if managed:
+        (skill_dir / module._MANAGED_META).write_text(json.dumps({"provider": "aidev-app-identity", "version": "1.0"}))
+
+    def fail(*args, **kwargs):
+        raise ValueError("download failed")
+
+    monkeypatch.setattr(module, "_install_skill", fail)
+    assert module.materialize_skills(object(), [{"id": "1", "skill_code": "demo", "version": "2.0"}], tmp_path) == []
+    assert skill_dir.exists() is (not managed)
+
+
 def test_openclaw_2026_8_migration_removes_empty_ui(module):
     config = {"ui": {"assistant": {"name": "legacy"}}}
 

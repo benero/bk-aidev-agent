@@ -84,6 +84,22 @@ def test_proxy_sends_identity_only_to_final_allowed_url(proxy):
     assert handler.wfile.getvalue() == b"ok"
 
 
+@pytest.mark.parametrize("tenant", [None, "", "tenant-a"])
+@pytest.mark.parametrize("incoming", [None, "untrusted-tenant"])
+def test_proxy_uses_trusted_application_tenant(proxy, monkeypatch, tenant, incoming):
+    handler, statuses, requests = proxy
+    if tenant is None:
+        monkeypatch.delenv("BKPAAS_APP_TENANT_ID", raising=False)
+    else:
+        monkeypatch.setenv("BKPAAS_APP_TENANT_ID", tenant)
+    if incoming is not None:
+        handler.headers["x-bk-tenant-id"] = incoming
+    handler.path = PREFIX + "/models"
+    handler._proxy()
+    assert statuses == [200]
+    assert requests[0].headers["X-Bk-Tenant-Id"] == (tenant or "default")
+
+
 @pytest.mark.parametrize("finish_reason,tool_call", [(None, False), (None, True), ("stop", False)])
 def test_chat_done_completes_without_waiting_for_http_eof(proxy, finish_reason, tool_call):
     handler, _, _ = proxy
