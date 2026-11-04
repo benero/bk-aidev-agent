@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -33,6 +34,11 @@ from typing import Any, Callable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from aidev_agent.packages.craw.mcp_identity import (
     EGRESS_KEY_ENV,
@@ -131,10 +137,8 @@ def rewrite_openclaw_config_file(
     egress_key: str = "",
 ) -> dict[str, Any]:
     """串行改写 MCP；重入时保留已改写条目的真实上游路由。"""
-    try:
-        import fcntl
-    except ImportError as exc:  # PaaS 运行时为 Linux；其它平台无安全锁时拒绝改写
-        raise RuntimeError("当前平台不支持 MCP 配置文件锁") from exc
+    if fcntl is None:
+        raise RuntimeError("当前平台不支持 MCP 配置文件锁")
 
     lock_path = f"{path}.craw-egress.lock"
     with open(lock_path, "a+", encoding="utf-8") as lock:
@@ -210,6 +214,7 @@ class McpEgress:
         self._lease_id = ""
         self._token = ""
         self._leased_at = 0.0
+        self._reservation_deadline = 0.0
         self._drain_until = 0.0
         # 非空表示槽位处于隔离态（TTL 过期且旧运行未交接），值为过期租约 ID
         self._quarantine_lease_id = ""
@@ -253,6 +258,15 @@ class McpEgress:
             return self._key
 
     def _expire_if_needed_locked(self) -> None:
+        if self._reservation_deadline:
+            if time.monotonic() < self._reservation_deadline:
+                return
+            # 尚未确认，不可能有合法内核运行，直接回收不进入隔离。
+            self._lease_id = ""
+            self._token = ""
+            self._leased_at = 0.0
+            self._reservation_deadline = 0.0
+            self._cond.notify_all()
         if not self._lease_id or self.lease_ttl <= 0:
             return
         if (time.monotonic() - self._leased_at) < self.lease_ttl:
@@ -264,7 +278,7 @@ class McpEgress:
         self._leased_at = 0.0
         self._cond.notify_all()
 
-    def acquire(self, token: str, timeout: float = 30.0) -> str:
+    def acquire(self, token: str, timeout: float = 30.0, *, reservation_ttl: float = 0.0) -> str:
         """占用共享槽并返回本次租约 ID；被占用、隔离中或超时返回空串。"""
         token = normalize_access_token(token)
         if not token:
@@ -281,10 +295,13 @@ class McpEgress:
                     self._lease_id = secrets.token_hex(16)
                     self._token = token
                     self._leased_at = now
+                    self._reservation_deadline = now + reservation_ttl if reservation_ttl > 0 else 0.0
                     self._cond.notify_all()
                     return self._lease_id
                 if self._lease_id:
                     wait_for = remaining
+                    if self._reservation_deadline:
+                        wait_for = min(wait_for, max(0.01, self._reservation_deadline - now))
                     if self.lease_ttl > 0 and self._leased_at:
                         wait_for = min(wait_for, max(0.05, self.lease_ttl - (now - self._leased_at)))
                 elif self._quarantine_lease_id:
@@ -294,6 +311,15 @@ class McpEgress:
                     wait_for = min(remaining, max(0.05, self._drain_until - now))
                 self._cond.wait(timeout=wait_for)
 
+    def confirm(self, lease_id: str) -> bool:
+        """确认已收到 reservation；过期/非持有者拒绝，重复确认幂等。"""
+        with self._cond:
+            self._expire_if_needed_locked()
+            if not lease_id or lease_id != self._lease_id:
+                return False
+            self._reservation_deadline = 0.0
+            return True
+
     def release(self, lease_id: str = "") -> bool:
         """释放租约。仅持有者可释放；过期持有者的迟到 release 用于解除隔离。"""
         with self._cond:
@@ -301,6 +327,7 @@ class McpEgress:
                 self._lease_id = ""
                 self._token = ""
                 self._leased_at = 0.0
+                self._reservation_deadline = 0.0
                 self._drain_until = time.monotonic() + self.drain_seconds
                 self._cond.notify_all()
                 return True
@@ -326,7 +353,7 @@ class McpEgress:
     def current_token(self) -> str:
         with self._cond:
             self._expire_if_needed_locked()
-            return self._token
+            return "" if self._reservation_deadline else self._token
 
     def start(self) -> "McpEgress":
         egress = self
@@ -366,12 +393,31 @@ class McpEgress:
                     return
                 parsed = urlparse(self.path)
                 if parsed.path == "/internal/acquire":
-                    token = normalize_access_token((self._read_json().get("token") or ""))
-                    lease_id = egress.acquire(token)
+                    request = self._read_json()
+                    token = normalize_access_token(request.get("token") or "")
+                    try:
+                        timeout = max(0.001, min(float(request.get("timeout", 30)), 30.0))
+                    except (TypeError, ValueError):
+                        self._json(400, {"ok": False, "error": "invalid timeout"})
+                        return
+                    lease_id = egress.acquire(token, timeout=timeout, reservation_ttl=5.0)
                     if lease_id:
-                        self._json(200, {"ok": True, "identityId": SHARED_ID, "leaseId": lease_id})
+                        try:
+                            self._json(200, {"ok": True, "identityId": SHARED_ID, "leaseId": lease_id})
+                        except (BrokenPipeError, ConnectionResetError):
+                            egress.release(lease_id)
                     else:
                         self._json(503, {"ok": False, "error": "MCP 身份租约忙碌、隔离中或 token 为空"})
+                    return
+                if parsed.path == "/internal/confirm":
+                    lease_id = str(self._read_json().get("leaseId") or "")
+                    if egress.confirm(lease_id):
+                        try:
+                            self._json(200, {"ok": True})
+                        except (BrokenPipeError, ConnectionResetError):
+                            egress.release(lease_id)
+                    else:
+                        self._json(409, {"ok": False, "error": "reservation 已失效"})
                     return
                 if parsed.path == "/internal/release":
                     lease_id = str(self._read_json().get("leaseId") or "")
@@ -516,8 +562,6 @@ def serve_forever(host: str = "127.0.0.1", port: int = 18787, config_path: str =
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="craw MCP egress")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=int(os.getenv("BKAI_MCP_EGRESS_PORT") or 18787))

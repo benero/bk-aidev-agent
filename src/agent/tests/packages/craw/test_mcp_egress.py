@@ -8,6 +8,7 @@ from threading import Event, Thread
 
 import httpx
 import pytest
+from aidev_agent.packages.craw import mcp_identity as identity_module
 from aidev_agent.packages.craw.mcp_egress import (
     SHARED_ID,
     McpEgress,
@@ -443,3 +444,65 @@ def test_release_enters_drain_window(upstream):
         assert egress.acquire("user-token-b")
     finally:
         egress.stop()
+
+
+def test_unconfirmed_reservation_expires_without_identity_or_quarantine():
+    egress = McpEgress(drain_seconds=0)
+    lease_id = egress.acquire("first", reservation_ttl=0.01)
+    assert lease_id
+    assert egress.current_token() == ""
+    time.sleep(0.02)
+    assert egress.confirm(lease_id) is False
+    assert egress.current_token() == ""
+    next_id = egress.acquire("next", timeout=0.1)
+    assert next_id
+    assert egress.current_token() == "next"
+
+
+def test_reservation_confirm_is_owned_and_idempotent():
+    egress = McpEgress(drain_seconds=0)
+    lease_id = egress.acquire("first", reservation_ttl=5)
+    assert egress.confirm("foreign") is False
+    assert egress.current_token() == ""
+    assert egress.confirm(lease_id) is True
+    assert egress.confirm(lease_id) is True
+    assert egress.current_token() == "first"
+    assert egress.release(lease_id) is True
+    assert egress.confirm(lease_id) is False
+
+
+def test_lost_confirmation_response_releases_known_reservation(monkeypatch):
+    egress = McpEgress(drain_seconds=0)
+    calls = []
+
+    class LeaseClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json, headers):
+            endpoint = url.rsplit("/", 1)[-1]
+            calls.append(endpoint)
+            if endpoint == "acquire":
+                lease_id = egress.acquire(json["token"], reservation_ttl=5)
+                return httpx.Response(200, json={"leaseId": lease_id}, request=httpx.Request("POST", url))
+            if endpoint == "confirm":
+                assert egress.confirm(json["leaseId"])
+                raise httpx.ReadTimeout("lost confirmation")
+            assert endpoint == "release"
+            assert egress.release(json["leaseId"])
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setenv("BKAI_MCP_EGRESS_URL", "http://localhost")
+    monkeypatch.setenv(EGRESS_KEY_ENV, "test-key")
+    monkeypatch.setattr(identity_module.httpx, "Client", LeaseClient)
+    with pytest.raises(CrawLeaseError, match="确认失败"), mcp_identity_lease("first"):
+        pytest.fail("unconfirmed caller must not start a run")
+    assert calls == ["acquire", "confirm", "release"]
+    assert egress.current_token() == ""
+    assert egress.acquire("next", timeout=0.1)

@@ -74,13 +74,18 @@ def test_events_marks_lifecycle_end_as_confirmed_termination():
             return json.dumps(
                 {
                     "event": "agent",
-                    "payload": {"stream": "lifecycle", "data": {"phase": "end", "stopReason": "aborted"}},
+                    "payload": {
+                        "runId": "active",
+                        "stream": "lifecycle",
+                        "data": {"phase": "end", "stopReason": "aborted"},
+                    },
                 }
             )
 
     session = OpenClawWSSession("ws://127.0.0.1:18789/", "token")
     session._ws = FakeWS()
 
+    session._run_id = "active"
     assert [event.kind for event in session.events()] == ["cancelled"]
     assert session.terminated is True
 
@@ -111,3 +116,56 @@ def test_cancel_sends_chat_abort_without_closing_transport():
     assert session._ws.sent[-1]["params"]["sessionKey"] == "session-1"
     assert session._ws.timeouts[-1] == 10
     assert session._ws.closed is False
+
+
+@pytest.mark.parametrize("foreign_run", ["other", None])
+def test_events_ignore_foreign_run_and_unrelated_response(monkeypatch, foreign_run):
+    session = OpenClawWSSession("ws://localhost", "token")
+    session._run_id = "active"
+    session._chat_request_id = "request"
+    messages = iter(
+        [
+            {"type": "res", "id": "other-request", "ok": False},
+            {"event": "agent", "payload": {"runId": foreign_run, "stream": "assistant", "data": {"delta": "secret"}}},
+            {"event": "agent", "payload": {"runId": foreign_run, "stream": "lifecycle", "data": {"phase": "end"}}},
+            {"event": "agent", "payload": {"runId": "active", "stream": "assistant", "data": {"delta": "answer"}}},
+            {"event": "agent", "payload": {"runId": "active", "stream": "lifecycle", "data": {"phase": "end"}}},
+        ]
+    )
+    monkeypatch.setattr(session, "_recv_json", lambda: next(messages))
+    assert [(event.kind, event.text) for event in session.events()] == [("text", "answer"), ("done", "")]
+    assert session.terminated
+
+
+@pytest.mark.parametrize(
+    "actual,expected,ok",
+    [
+        ([], [], True),
+        (
+            [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            [{"role": "user", "content": "hello"}],
+            True,
+        ),
+        ([], [{"role": "user", "content": "lost"}], False),
+        ([{"role": "assistant", "content": "foreign"}], [], False),
+    ],
+)
+def test_history_must_match_before_sending(actual, expected, ok):
+    class HistoryWS:
+        def send(self, text):
+            self.request = json.loads(text)
+
+        def settimeout(self, value):
+            pass
+
+        def recv(self):
+            return json.dumps({"type": "res", "id": self.request["id"], "ok": True, "payload": {"messages": actual}})
+
+    session = OpenClawWSSession("ws://localhost", "token")
+    session._ws = HistoryWS()
+    if ok:
+        session.verify_history("session-1", expected)
+    else:
+        with pytest.raises(OpenClawWSError, match="不支持安全恢复"):
+            session.verify_history("session-1", expected)
+    assert session._ws.request["method"] == "chat.history"

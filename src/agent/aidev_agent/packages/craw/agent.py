@@ -24,6 +24,7 @@ from typing import Any, Callable, ClassVar, Generator, Optional
 
 from ag_ui.core import (
     BaseEvent,
+    CustomEvent,
     EventType,
     RunErrorEvent,
     RunStartedEvent,
@@ -38,6 +39,7 @@ from ag_ui.encoder import EventEncoder
 from pydantic import BaseModel, Field
 
 from aidev_agent.core.ag_ui.events import ExtendToolCallResultEvent
+from aidev_agent.core.ag_ui.types import SessionPersistenceEventNames
 from aidev_agent.enums import AgentType
 from aidev_agent.packages.craw.base import (
     CrawIdentity,
@@ -52,7 +54,7 @@ from aidev_agent.packages.craw.mcp_identity import (
     mcp_identity_lease,
     resolve_user_access_token,
 )
-from aidev_agent.packages.craw.openclaw_ws import OpenClawWSError, OpenClawWSSession
+from aidev_agent.packages.craw.openclaw_ws import OpenClawHistoryError, OpenClawWSError, OpenClawWSSession
 from aidev_agent.packages.craw.registry import CrawBackendProtocol, get_backend
 from aidev_agent.services.agent.registry import AgentBuildContext
 from aidev_agent.services.messages_handler import GeneratorStreamingHelper
@@ -155,13 +157,37 @@ class CrawCompletionAgent(BaseModel):
         token = self.identity.access_token if self.identity else ""
         if bool(getattr(execute_kwargs, "stream", False)):
             thread = self.session_code or self.thread_id
-            return GeneratorStreamingHelper(thread_id=thread).stream(self._run_stream_with_mcp_lease(token))
-        with mcp_identity_lease(token):
-            return self._run_sync()
+            return GeneratorStreamingHelper(thread_id=thread).stream(
+                self._run_stream_with_mcp_lease(token, execute_kwargs),
+                attach_only=getattr(execute_kwargs, "stream_mode", "start") == "attach",
+                event_handler=self.event_handler,
+            )
+        if getattr(execute_kwargs, "stream_mode", "start") == "attach":
+            raise ValueError("attach 仅支持流式请求")
+        with mcp_identity_lease(token) as lease:
+            self._prepare_input(execute_kwargs)
+            return self._run_sync(lease)
 
-    def _run_stream_with_mcp_lease(self, token: str) -> Generator[str, None, None]:
+    def _prepare_input(self, execute_kwargs) -> None:
+        """仅由实际 producer 持久化本轮输入；attach/replay 不重复落库。"""
+        if getattr(execute_kwargs, "resume", None):
+            raise ValueError("craw 暂不支持恢复审批或用户问题中断")
+        input_text = getattr(execute_kwargs, "input", None)
+        if input_text:
+            self._dispatch(
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=SessionPersistenceEventNames.UserInputSaved.value,
+                    value={"content": input_text, "turn_id": getattr(execute_kwargs, "turn_id", None)},
+                )
+            )
+            self.session_context_data.append({"role": "user", "content": input_text})
+            self.chat_history = build_openai_messages(self.session_context_data)
+
+    def _run_stream_with_mcp_lease(self, token: str, execute_kwargs=None) -> Generator[str, None, None]:
         try:
             with mcp_identity_lease(token) as lease:
+                self._prepare_input(execute_kwargs)
                 yield from self._run_stream(lease)
         except CrawLeaseError as exc:
             # fail-closed：租约失败时终止本次运行，绝不沿用共享槽中的上一身份；
@@ -241,7 +267,7 @@ class CrawCompletionAgent(BaseModel):
         if backend is not None and backend.name == "openclaw" and backend.transport == "ws":
             yield from self._run_stream_ws(lease)
             return
-        yield from self._run_stream_http()
+        yield from self._run_stream_http(lease)
 
     def _last_user_message(self) -> str:
         for item in reversed(build_openai_messages(self.session_context_data)):
@@ -287,8 +313,13 @@ class CrawCompletionAgent(BaseModel):
             session.connect()
             self._track_stream(thread, session)
             try:
-                session.send_chat(thread, self._last_user_message())
+                messages = build_openai_messages(self.session_context_data)
+                if not messages or messages[-1]["role"] != "user":
+                    raise OpenClawWSError("WS 对话必须以本轮用户输入结束")
+                session.verify_history(thread, messages[:-1])
+                # send 也可能在已写出请求后失败，先标记不确定态。
                 run_started = True
+                session.send_chat(thread, messages[-1]["content"])
                 for event in session.events():
                     if GeneratorStreamingHelper.is_cancelled(thread):
                         if not session.cancel_requested:
@@ -357,9 +388,13 @@ class CrawCompletionAgent(BaseModel):
                     event_handler=self._dispatch,
                 )
                 return
+            if not session.terminated:
+                raise OpenClawWSError("连接在运行终态确认前结束")
             if text_open:
                 yield from self._emit_text_end(encoder, message_id)
             yield from self._emit_finish(run_id)
+        except OpenClawHistoryError as exc:
+            yield from self._emit_error_and_finish(encoder, run_id, str(exc))
         except OpenClawWSError as exc:
             logger.warning("[CRAW] OpenClaw WS unavailable: %s", exc)
             if text_open:
@@ -465,7 +500,7 @@ class CrawCompletionAgent(BaseModel):
             )
             open_tools.discard(call_id)
 
-    def _run_stream_http(self) -> Generator[str, None, None]:
+    def _run_stream_http(self, lease: Optional[McpIdentityLease] = None) -> Generator[str, None, None]:
         encoder = EventEncoder()
         run_id = str(uuid.uuid4())
         message_id = str(uuid.uuid4())
@@ -481,6 +516,7 @@ class CrawCompletionAgent(BaseModel):
             return
 
         text_open = False
+        terminated = False
         try:
             stream = backend.open_chat_stream(
                 build_openai_messages(self.session_context_data),
@@ -524,6 +560,7 @@ class CrawCompletionAgent(BaseModel):
                     thread_id=self.thread_id, run_id=RunId.CANCELLED, event_handler=self._dispatch
                 )
                 return
+            terminated = True
             if text_open:
                 yield from self._emit_text_end(encoder, message_id)
             yield from self._emit_finish(run_id)
@@ -549,17 +586,26 @@ class CrawCompletionAgent(BaseModel):
                 encoder, run_id, f"转发 craw({backend.name}) 失败: {type(exc).__name__}"
             )
 
+        finally:
+            if lease is not None and not terminated:
+                lease.quarantine()
+
     # ---------------- 非流式：转发 craw + 适配回 ChatCompletionAgent 形状 ----------------
 
-    def _run_sync(self) -> dict:
+    def _run_sync(self, lease: Optional[McpIdentityLease] = None) -> dict:
         backend: CrawBackendProtocol = self.backend
         if backend is None:
             raise RuntimeError("craw backend 未装配（检查 BKAI_CRAW_BACKEND）")
-        body = backend.chat_completions(
-            build_openai_messages(self.session_context_data),
-            identity=self.identity,
-            session_code=self.session_code,
-        )
+        try:
+            body = backend.chat_completions(
+                build_openai_messages(self.session_context_data),
+                identity=self.identity,
+                session_code=self.session_code,
+            )
+        except BaseException:
+            if lease is not None:
+                lease.quarantine()
+            raise
         content = backend.message_text(body)
         # 与 ChatCompletionAgent._execute 非流式返回同构 → save_ai_response 可直接取 choices[0].delta.content
         return {

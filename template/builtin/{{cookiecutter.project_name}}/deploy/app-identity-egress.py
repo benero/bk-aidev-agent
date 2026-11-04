@@ -14,7 +14,7 @@ import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -62,6 +62,37 @@ def _fix_non_stream(body: bytes) -> bytes:
         return body
     print("[app-identity-egress] normalized non-stream tool_calls finish_reason", file=sys.stderr)
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _allowed_target(origin: str, request_target: str, allowed_prefix: str) -> httpx.URL | None:
+    """Validate the decoded path and the exact URL HTTPX will send before adding identity."""
+    try:
+        request = urlsplit(request_target)
+        if request.scheme or request.netloc or request.fragment or not request.path.startswith("/"):
+            return None
+        decoded = request.path
+        while True:
+            expanded = unquote(decoded)
+            if expanded == decoded:
+                break
+            decoded = expanded
+        if "\\" in decoded or any(part in {".", ".."} for part in decoded.split("/")):
+            return None
+        if any(ord(char) < 32 or ord(char) == 127 for char in request_target + decoded):
+            return None
+        path = decoded.rstrip("/")
+        if path != allowed_prefix and not path.startswith(f"{allowed_prefix}/"):
+            return None
+        base = httpx.URL(origin)
+        target = httpx.URL(f"{origin}{request_target}")
+        boundary = httpx.URL(f"{origin}{allowed_prefix}").path.rstrip("/")
+        if (target.scheme, target.host, target.port) != (base.scheme, base.host, base.port):
+            return None
+        if target.path.rstrip("/") != boundary and not target.path.startswith(f"{boundary}/"):
+            return None
+        return target
+    except (ValueError, httpx.InvalidURL):
+        return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -152,11 +183,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(503, "AIDEV upstream origin is unavailable")
             return
         allowed_prefix = os.getenv("BKAI_AIDEV_APP_UPSTREAM_PATH_PREFIX", "/openapi/aidev/gateway/llm/v1").rstrip("/")
-        request_path = urlsplit(self.path).path.rstrip("/")
-        if request_path != allowed_prefix and not request_path.startswith(f"{allowed_prefix}/"):
+        target = _allowed_target(origin, self.path, allowed_prefix)
+        if target is None:
             self.send_error(403, "AIDEV upstream path is not allowed")
             return
-        target = f"{origin}{self.path}"
         content_length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(content_length) if content_length else b""
         headers = {

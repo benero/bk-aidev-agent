@@ -2,6 +2,7 @@
 """CrawCompletionAgent：消息装配 / 非流式 / 流式事件翻译 / 身份 fail-closed / 取消中断（后端打桩，无真实 HTTP）。"""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from aidev_agent.enums import AgentType
@@ -13,9 +14,12 @@ from aidev_agent.packages.craw import (
     CrawUpstreamRunError,
     OpenClawBackend,
 )
+from aidev_agent.packages.craw import agent as agent_module
 from aidev_agent.packages.craw.agent import build_openai_messages
-from aidev_agent.packages.craw.mcp_identity import McpIdentityLease
+from aidev_agent.packages.craw.mcp_identity import McpIdentityLease, bind_user_access_token
+from aidev_agent.packages.craw.openclaw_ws import OpenClawEvent
 from aidev_agent.services.agent.registry import AgentBuildContext
+from aidev_agent.services.messages_handler.base import StreamAttachUnavailableError
 from aidev_agent.utils.event import RunId
 
 
@@ -92,7 +96,7 @@ def _build_agent(
         resource_manager=_StubResourceManager() if resource_manager is _DEFAULT_RM else resource_manager,
         session_code=session_code,
         username="demo-user",
-        session_context_data=session_context or [{"role": "user", "content": "hi"}],
+        session_context_data=session_context if session_context is not None else [{"role": "user", "content": "hi"}],
     )
     return agent_cls(backend=backend).build(ctx)
 
@@ -139,9 +143,6 @@ class TestCrawCompletionAgent:
         assert "".join(e.delta for e in events if e.type.value == "TEXT_MESSAGE_CONTENT") == "hello"
 
     def test_ws_stream_translates_tool_events_to_ag_ui(self, monkeypatch):
-        from aidev_agent.packages.craw import agent as agent_module
-        from aidev_agent.packages.craw.openclaw_ws import OpenClawEvent
-
         sessions = []
 
         class _FakeWSSession:
@@ -155,6 +156,9 @@ class TestCrawCompletionAgent:
 
             def connect(self):
                 return None
+
+            def verify_history(self, session_key, expected):
+                assert expected == []
 
             def send_chat(self, session_key, message, agent_id=""):
                 self.sent = (session_key, message, agent_id)
@@ -177,6 +181,7 @@ class TestCrawCompletionAgent:
                     result={"content": [{"type": "text", "text": "ok"}], "details": {"durationMs": 25}},
                 )
                 yield OpenClawEvent("text", text="查询完成")
+                self.terminated = True
                 yield OpenClawEvent("done")
 
             def abort(self, session_key):
@@ -308,8 +313,6 @@ class TestStopInterruptsStream:
         assert "RUN_ERROR" not in types  # 取消不是错误
 
     def test_stop_closes_tracked_stream_and_sets_cancel(self, monkeypatch):
-        from aidev_agent.packages.craw import agent as agent_module
-
         cancelled = []
         monkeypatch.setattr(
             agent_module.GeneratorStreamingHelper, "cancel", classmethod(lambda cls, key: cancelled.append(key))
@@ -325,8 +328,6 @@ class TestStopInterruptsStream:
         assert stream.closed is True
 
     def test_stop_prefers_abort_without_closing_websocket(self, monkeypatch):
-        from aidev_agent.packages.craw import agent as agent_module
-
         class _CancelableStream:
             def __init__(self):
                 self.cancelled = []
@@ -351,9 +352,6 @@ class TestStopInterruptsStream:
 
     @pytest.mark.parametrize(("terminated", "expected_quarantine"), [(False, True), (True, False)])
     def test_ws_cancel_quarantines_lease_until_lifecycle_end(self, monkeypatch, terminated, expected_quarantine):
-        from aidev_agent.packages.craw import agent as agent_module
-        from aidev_agent.packages.craw.openclaw_ws import OpenClawEvent
-
         class _CancelWSSession:
             def __init__(self, *_args, **_kwargs):
                 self.cancel_requested = True
@@ -361,6 +359,9 @@ class TestStopInterruptsStream:
 
             def connect(self):
                 return None
+
+            def verify_history(self, session_key, expected):
+                assert expected == []
 
             def send_chat(self, *_args, **_kwargs):
                 return "run-1"
@@ -398,8 +399,6 @@ class TestIdentityFailClosed:
         assert agent.identity.access_token == "fake-token-xyz"
 
     def test_bound_request_token_wins_over_empty_rm(self):
-        from aidev_agent.packages.craw.mcp_identity import bind_user_access_token
-
         bind_user_access_token("request-token-aaa")
         try:
             agent = _build_agent(_StubBackend(), resource_manager=_StubResourceManager(token=""))
@@ -495,3 +494,185 @@ class TestStreamErrorChunkEmitsRunError:
         assert types[-3:] == ["TEXT_MESSAGE_END", "RUN_ERROR", "RUN_FINISHED"]
         error_message = next(e.message for e in events if e.type.value == "RUN_ERROR")
         assert "secret-detail" not in error_message
+
+
+def test_execute_includes_and_persists_current_input():
+    backend = _StubBackend(body={"choices": [{"message": {"content": "answer"}}]})
+    agent = _build_agent(backend, session_context=[])
+    events = []
+    agent.event_handler = events.append
+    agent.execute(SimpleNamespace(input="new question", turn_id="turn-1", stream=False))
+    assert backend.calls[0]["messages"] == [{"role": "user", "content": "new question"}]
+    assert events[0].name == "user_input_saved"
+    assert events[0].value == {"content": "new question", "turn_id": "turn-1"}
+    assert agent.chat_history == backend.calls[0]["messages"]
+
+
+def test_attach_does_not_prepare_input_or_start_upstream(monkeypatch):
+    captured = {}
+
+    def stream(_helper, generator, **kwargs):
+        captured.update(kwargs)
+        generator.close()
+        return iter(["replay"])
+
+    monkeypatch.setattr(agent_module.GeneratorStreamingHelper, "stream", stream)
+    backend = _StubBackend()
+    agent = _build_agent(backend, session_context=[])
+    events = []
+    agent.event_handler = events.append
+    result = agent.execute(SimpleNamespace(input="ignored", stream=True, stream_mode="attach"))
+    assert list(result) == ["replay"]
+    assert captured["attach_only"] is True
+    assert backend.calls == []
+    assert events == []
+    assert agent.session_context_data == []
+
+
+@pytest.mark.parametrize("failure", [TimeoutError(), CrawStreamProtocolError("openclaw", "eof")])
+def test_http_failure_quarantines_lease(monkeypatch, failure):
+    backend = _StubBackend()
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(backend, "open_chat_stream", fail)
+    lease = McpIdentityLease("lease-1")
+    list(_build_agent(backend)._run_stream(lease))
+    assert lease.quarantined is True
+
+
+def test_http_confirmed_completion_releases_lease():
+    lease = McpIdentityLease("lease-1")
+    list(_build_agent(_StubBackend())._run_stream(lease))
+    assert lease.quarantined is False
+
+
+def test_http_sync_timeout_quarantines_lease(monkeypatch):
+    backend = _StubBackend()
+
+    def fail(*_args, **_kwargs):
+        raise TimeoutError()
+
+    monkeypatch.setattr(backend, "chat_completions", fail)
+    lease = McpIdentityLease("lease-1")
+    with pytest.raises(TimeoutError):
+        _build_agent(backend)._run_sync(lease)
+    assert lease.quarantined is True
+
+
+def test_stream_execute_persists_input_once_in_real_producer():
+    backend = _StubBackend(chunks=[{"choices": [{"delta": {"content": "answer"}}]}])
+    agent = _build_agent(backend, session_context=[], session_code="input-producer")
+    events = []
+    agent.event_handler = events.append
+    list(agent.execute(SimpleNamespace(input="new", turn_id="turn", stream=True)))
+    assert backend.calls[0]["messages"] == [{"role": "user", "content": "new"}]
+    assert len([event for event in events if getattr(event, "name", None) == "user_input_saved"]) == 1
+
+
+def test_attach_without_existing_stream_never_starts_new_run():
+    backend = _StubBackend()
+    agent = _build_agent(backend, session_context=[], session_code="attach-no-producer")
+    events = []
+    agent.event_handler = events.append
+    with pytest.raises(StreamAttachUnavailableError):
+        list(agent.execute(SimpleNamespace(input="ignored", stream=True, stream_mode="attach")))
+    assert backend.calls == []
+    assert not any(getattr(event, "name", None) == "user_input_saved" for event in events)
+
+
+def test_ws_history_failure_is_actionable_without_starting_run(monkeypatch):
+    class MissingHistorySession:
+        terminated = False
+        sent = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def verify_history(self, *_args):
+            raise agent_module.OpenClawHistoryError("历史不一致，WS 不支持安全恢复；请使用 HTTP")
+
+        def send_chat(self, *_args):
+            self.sent = True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_module, "OpenClawWSSession", MissingHistorySession)
+    backend = _StubBackend()
+    backend.transport = "ws"
+    agent = _build_agent(backend)
+    events = []
+    agent.event_handler = events.append
+    lease = McpIdentityLease("lease-1")
+    list(agent._run_stream(lease))
+    errors = [event.message for event in events if event.type.value == "RUN_ERROR"]
+    assert errors == ["历史不一致，WS 不支持安全恢复；请使用 HTTP"]
+    assert lease.quarantined is False
+    assert MissingHistorySession.sent is False
+
+
+def test_http_cancel_quarantines_lease(monkeypatch):
+    monkeypatch.setattr(agent_module.GeneratorStreamingHelper, "is_cancelled", classmethod(lambda cls, key: True))
+    lease = McpIdentityLease("lease-1")
+    backend = _StubBackend(chunks=[{"choices": [{"delta": {"content": "answer"}}]}])
+    list(_build_agent(backend)._run_stream(lease))
+    assert lease.quarantined is True
+    assert backend.streams[0].closed is True
+
+
+def test_ws_eof_without_terminal_is_error_and_quarantines(monkeypatch):
+    class DisconnectedSession:
+        terminated = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def verify_history(self, *_args):
+            pass
+
+        def send_chat(self, *_args):
+            pass
+
+        def events(self):
+            return iter([])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_module, "OpenClawWSSession", DisconnectedSession)
+    backend = _StubBackend()
+    backend.transport = "ws"
+    agent = _build_agent(backend)
+    events = []
+    agent.event_handler = events.append
+    lease = McpIdentityLease("lease-1")
+    list(agent._run_stream(lease))
+    assert any(event.type.value == "RUN_ERROR" for event in events)
+    assert lease.quarantined is True
+
+
+def test_http_eof_after_text_quarantines(monkeypatch):
+    class InterruptedStream(_FakeStream):
+        def __iter__(self):
+            yield {"choices": [{"delta": {"content": "partial"}}]}
+            raise CrawStreamProtocolError("openclaw", "missing DONE")
+
+    backend = _StubBackend()
+    stream = InterruptedStream([])
+    monkeypatch.setattr(backend, "open_chat_stream", lambda *_args, **_kwargs: stream)
+    lease = McpIdentityLease("lease-1")
+    events = []
+    agent = _build_agent(backend)
+    agent.event_handler = events.append
+    list(agent._run_stream(lease))
+    assert lease.quarantined
+    assert stream.closed
+    assert any(event.type.value == "RUN_ERROR" for event in events)
