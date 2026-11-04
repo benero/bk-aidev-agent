@@ -67,10 +67,15 @@ def _install_skill(manager: AgentResourceManager, skill: dict, skills_root: Path
     callee_agent_code = skill.get("callee_agent_code") or None
     slug = _skill_slug(skill)
     print(f"[craw] syncing skill {slug}: resolve application download", file=sys.stderr)
+    config_version = os.getenv("BKAI_CRAW_AGENT_CONFIG_VERSION", "").strip()
+    current_agent_code = os.getenv("BKAI_AGENT") or os.getenv("BKPAAS_APP_ID") or os.getenv("BK_APP_CODE")
+    is_current_agent = not callee_agent_code or callee_agent_code == current_agent_code
+    download_context = {"params": {"agent_version": config_version}} if config_version and is_current_agent else {}
     download = manager.retrieve_skill_download(
         str(skill_id),
         version=version,
         callee_agent_code=callee_agent_code,
+        **download_context,
     )
     download_url = download.get("url")
     if not download_url:
@@ -206,7 +211,12 @@ def main() -> int:
         return 4
 
     manager = AgentResourceManager()
-    config = manager.get_agent_config(agent_code)
+    config_version = os.getenv("BKAI_CRAW_AGENT_CONFIG_VERSION", "").strip()
+    config = (
+        manager.get_agent_config(agent_code, version=config_version)
+        if config_version
+        else manager.get_agent_config(agent_code)
+    )
     model = (config.chat_model or "").strip()
     if not model:
         print(f"agent {agent_code} has no chat model", file=sys.stderr)

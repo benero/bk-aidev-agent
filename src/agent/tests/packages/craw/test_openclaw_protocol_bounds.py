@@ -219,7 +219,8 @@ def test_ticks_cannot_extend_absolute_deadline(monkeypatch):
 
 
 @pytest.mark.parametrize("terminal_status,can_reuse", [("error", True), ("unknown", False)])
-def test_confirmed_error_releases_lease_for_next_run(monkeypatch, terminal_status, can_reuse):
+@pytest.mark.parametrize("terminal_source", ["agent", "chat"])
+def test_confirmed_error_releases_lease_for_next_run(monkeypatch, terminal_status, can_reuse, terminal_source):
     class KernelWire:
         def __init__(self):
             self.messages = []
@@ -235,16 +236,12 @@ def test_confirmed_error_releases_lease_for_next_run(monkeypatch, terminal_statu
             if request["method"] == "chat.history":
                 self.messages.append({"type": "res", "id": request["id"], "ok": True, "payload": {"messages": []}})
             elif request["method"] == "chat.send":
-                self.messages.append(
-                    {
-                        "event": "agent",
-                        "payload": {
-                            "runId": request["params"]["idempotencyKey"],
-                            "stream": "lifecycle",
-                            "data": {"phase": "error", "error": "model failed"},
-                        },
-                    }
-                )
+                payload = {"runId": request["params"]["idempotencyKey"]}
+                if terminal_source == "chat":
+                    payload.update(state="error", errorMessage="dispatch failed before agent start")
+                else:
+                    payload.update(stream="lifecycle", data={"phase": "error", "error": "model failed"})
+                self.messages.append({"event": terminal_source, "payload": payload})
             else:
                 self.messages.append(
                     {
@@ -308,3 +305,22 @@ def test_abort_shortens_absolute_run_deadline(monkeypatch):
     monkeypatch.setattr(session, "_send", lambda request: None)
     assert session.abort("session")
     assert session._run_deadline == 10
+
+
+@pytest.mark.parametrize("foreign_state", ["error", "final", "aborted"])
+def test_foreign_chat_terminal_never_triggers_confirmation(monkeypatch, foreign_state):
+    now = [0.0]
+    monkeypatch.setattr(ws_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    session = OpenClawWSSession("ws://localhost", "token", timeout=3)
+    session._run_id = "active"
+    wire = RunWire(session, now, [], ["ok"])
+    wire.messages.extend(
+        [
+            {"event": "chat", "payload": {"runId": "foreign", "state": foreign_state, "errorMessage": "foreign error"}},
+            {"event": "chat", "payload": {"runId": "active", "state": "final"}},
+        ]
+    )
+    session._ws = wire
+    assert [(event.kind, event.text) for event in session.events()] == [("done", "")]
+    assert wire.sent == [0.1]  # 两个帧均已读取；外来终态未触发查询。
+    assert session.terminated
