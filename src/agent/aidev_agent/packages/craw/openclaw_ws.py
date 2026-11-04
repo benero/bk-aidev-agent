@@ -354,6 +354,7 @@ class OpenClawWSSession:
         candidate = None
         wait_request_id = ""
         next_poll = 0.0
+        received_text = False
         while True:
             now = time.monotonic()
             if self._run_deadline is not None:
@@ -411,11 +412,9 @@ class OpenClawWSSession:
                         if status == "error":
                             yield OpenClawEvent("error", text=str(payload.get("error") or "OpenClaw运行失败"))
                         else:
-                            yield (
-                                candidate
-                                if candidate is not None and candidate.kind == "cancelled"
-                                else OpenClawEvent("done")
-                            )
+                            # chat dedupe 的 ok 只确认 dispatch 返回；模型 isError
+                            # payload 也可正常返回，业务结果仍由最后一个候选决定。
+                            yield candidate if candidate is not None else OpenClawEvent("done")
                         return
                     if status != "timeout":
                         yield OpenClawEvent("error", text="未知的内核运行终态")
@@ -432,6 +431,20 @@ class OpenClawWSSession:
                 if payload.get("runId") == self._run_id:
                     state = payload.get("state")
                     if state in {"final", "error", "aborted"}:
+                        if state == "final" and not received_text:
+                            # /help 等命令没有 agent delta，只在 final 提供正文；
+                            # 普通 agent 的 final 是已输出正文快照，不重复发送。
+                            message = payload.get("message") or {}
+                            content = message.get("content") if isinstance(message, dict) else None
+                            if isinstance(content, list):
+                                content = "".join(
+                                    part.get("text", "")
+                                    for part in content
+                                    if isinstance(part, dict) and part.get("type") == "text"
+                                )
+                            if isinstance(content, str) and content:
+                                received_text = True
+                                yield OpenClawEvent("text", text=content, raw=payload)
                         candidate = OpenClawEvent(
                             {"final": "done", "error": "error", "aborted": "cancelled"}[state],
                             text=str(payload.get("errorMessage") or ""),
@@ -451,8 +464,14 @@ class OpenClawWSSession:
             if event is None:
                 continue
             if event.kind in {"done", "cancelled", "error"}:
+                if event.kind == "done" and candidate is not None and candidate.kind == "error":
+                    # 同一 attempt 的收尾不撤销已报告的业务失败；只有新 start
+                    # 或后续 chat.final 才能替代这一错误候选。
+                    continue
                 candidate = event
                 continue
+            if event.kind == "text":
+                received_text = True
             yield event
 
     def _translate(self, payload: dict) -> Optional[OpenClawEvent]:

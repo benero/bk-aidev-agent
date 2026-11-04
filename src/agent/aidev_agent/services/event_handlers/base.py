@@ -187,6 +187,11 @@ class BaseSessionWriter(ABC):
 
     # ---------- 公共事件入口 ----------
 
+    @property
+    def write_error_count(self) -> int:
+        """本 writer 的持久化失败计数，供同步调用方确认保存结果。"""
+        return self._write_error_count
+
     def set_tools(self, tools: list | None) -> None:
         self._tools_mapping = {tool.name: tool for tool in tools} if tools else {}
 

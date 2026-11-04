@@ -157,14 +157,15 @@ def materialize_skills(
         if not isinstance(skill, dict):
             continue
         slug = _skill_slug(skill)
-        expected.add(slug)
         try:
             installed.append(_install_skill(manager, skill, skills_root))
+            expected.add(slug)
         except Exception as exc:
             error = _error_code(exc)
             failures.append({"skill": slug, "error": error})
             print(f"[craw] WARN: skipped skill {slug}: {error}", file=sys.stderr)
 
+    # A failed refresh must not leave a previous release's managed Skill loadable.
     for child in skills_root.iterdir():
         metadata_path = child / _MANAGED_META
         if not child.is_dir() or child.name in expected or not metadata_path.is_file():

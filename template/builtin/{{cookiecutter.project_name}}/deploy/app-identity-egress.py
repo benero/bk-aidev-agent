@@ -192,11 +192,14 @@ class Handler(BaseHTTPRequestHandler):
         headers = {
             key: value
             for key, value in self.headers.items()
-            if key.lower() not in HOP_BY_HOP | {"host", "content-length", "authorization", "x-bkapi-authorization"}
+            if key.lower()
+            not in HOP_BY_HOP | {"host", "content-length", "authorization", "x-bkapi-authorization", "x-bk-tenant-id"}
         }
         headers["X-Bkapi-Authorization"] = json.dumps(
             {"bk_app_code": app_code, "bk_app_secret": app_secret}, separators=(",", ":")
         )
+        # Match the SDK's application-tenant fallback; kernel input cannot select a different tenant.
+        headers["X-Bk-Tenant-Id"] = os.getenv("BKPAAS_APP_TENANT_ID") or "default"
 
         path = self.path.partition("?")[0].rstrip("/")
         is_chat = path.endswith("/chat/completions")
