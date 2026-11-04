@@ -169,3 +169,58 @@ def test_history_must_match_before_sending(actual, expected, ok):
         with pytest.raises(OpenClawWSError, match="不支持安全恢复"):
             session.verify_history("session-1", expected)
     assert session._ws.request["method"] == "chat.history"
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("openclaw", "session-1"),
+        ("openclaw/default", "session-1"),
+        ("openclaw:ops", "agent:ops:session-1"),
+        ("openclaw/OPS", "agent:ops:session-1"),
+        ("agent:ops", "agent:ops:session-1"),
+    ],
+)
+def test_model_routes_history_send_abort_to_same_agent(model, expected):
+    class Wire:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+        def recv(self):
+            return json.dumps({"type": "res", "id": self.sent[-1]["id"], "ok": True, "payload": {"messages": []}})
+
+        def settimeout(self, _timeout):
+            pass
+
+    session = OpenClawWSSession("ws://localhost", "token", model=model)
+    session._ws = Wire()
+    session.verify_history("session-1", [])
+    session.send_chat("session-1", "hello")
+    assert session.abort("session-1")
+    requests = session._ws.sent
+    assert [request["method"] for request in requests] == ["chat.history", "chat.send", "chat.abort"]
+    assert all(request["params"]["sessionKey"] == expected for request in requests)
+    assert all("agentId" not in request["params"] for request in requests)
+
+
+@pytest.mark.parametrize(
+    "model,key",
+    [
+        ("openclaw", "agent:ops:session-1"),
+        ("openclaw:ops", "agent:other:session-1"),
+        ("openclaw:ops", "agent:ops:"),
+        ("invalid-model", "session-1"),
+    ],
+)
+def test_ambiguous_agent_selection_is_rejected(model, key):
+    session = OpenClawWSSession("ws://localhost", "token", model=model)
+    with pytest.raises(OpenClawWSError):
+        session.session_key(key)
+
+
+def test_existing_matching_agent_key_is_not_nested():
+    session = OpenClawWSSession("ws://localhost", "token", model="agent:ops")
+    assert session.session_key("agent:ops:session-1") == "agent:ops:session-1"

@@ -1080,6 +1080,7 @@ class BaseSessionWriter(ABC):
             builtin_property={
                 "message_id": error_message_id,
                 "error": True,
+                **({"error_code": event.code} if event.code else {}),
             },
         )
 
@@ -1412,6 +1413,9 @@ class BaseSessionWriter(ABC):
             assistant_property["source_text"] = source_text
         if memory_source_complete is not None:
             assistant_property["memory_source_complete"] = memory_source_complete
+        if status == "error" and content == self.PAUSED_CONTENT_MESSAGE:
+            # 此 helper 的 error 写入是本地取消提示，不属于内核 assistant 历史。
+            assistant_property["local_notice"] = True
 
         # 记录 builtin_property，以便后续追加审批 tool_calls 时合并
         self._assistant_builtin_properties[message_id] = dict(assistant_property)

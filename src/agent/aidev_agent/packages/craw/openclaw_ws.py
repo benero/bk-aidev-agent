@@ -18,6 +18,7 @@
 
 import ipaddress
 import json
+import re
 import time
 import uuid
 from contextlib import suppress
@@ -101,10 +102,11 @@ class OpenClawHistoryError(OpenClawWSError):
 class OpenClawWSSession:
     """一次对话 = 一条连接。用完即弃，避免跨请求共享状态。"""
 
-    def __init__(self, url: str, token: str, timeout: float = 300.0):
+    def __init__(self, url: str, token: str, timeout: float = 300.0, *, model: str = "openclaw"):
         self.url = url
         self.token = token
         self.timeout = timeout
+        self.model = model
         self._ws = None
         self._run_id = ""
         self._chat_request_id = ""
@@ -204,18 +206,38 @@ class OpenClawWSSession:
         except ValueError:
             return None  # ping 等非 JSON 帧不该中断消费
 
-    def send_chat(self, session_key: str, message: str, *, agent_id: str = "") -> str:
+    def session_key(self, session_key: str) -> str:
+        """与 OpenClaw http-utils 的 routing model 别名保持一致。
+
+        chat.* schema 不接受 agentId；Agent 通过 agent:<id>:<session> 选择。
+        裸键由网关解析配置的默认 Agent，不能在 SDK 中假定默认名为 main。
+        """
+        model = self.model.strip().lower()
+        if model in {"", "openclaw", "openclaw/default"}:
+            if session_key.lower().startswith("agent:"):
+                raise OpenClawWSError("默认 Agent 模型不能与显式 Agent 会话键混用")
+            return session_key
+        match = re.fullmatch(r"(?:openclaw[:/]|agent:)([a-z0-9][a-z0-9_-]{0,63})", model)
+        if not match:
+            raise OpenClawWSError("WS model 必须使用 openclaw 或 openclaw/<agentId> 别名")
+        agent_id = match.group(1)
+        if session_key.lower().startswith("agent:"):
+            parts = session_key.split(":", 2)
+            if len(parts) != 3 or parts[1].lower() != agent_id or not parts[2]:
+                raise OpenClawWSError("model 与会话键的 Agent 不一致")
+            return f"agent:{agent_id}:{parts[2]}"
+        return f"agent:{agent_id}:{session_key}"
+
+    def send_chat(self, session_key: str, message: str) -> str:
         """发起一次对话，返回本次 run 的 id（用于过滤事件）。"""
         self._run_id = str(uuid.uuid4())
         self._cancel_requested = False
         self._terminated = False
         params = {
-            "sessionKey": session_key,
+            "sessionKey": self.session_key(session_key),
             "message": message,
             "idempotencyKey": self._run_id,
         }
-        if agent_id:
-            params["agentId"] = agent_id
         self._chat_request_id = uuid.uuid4().hex
         self._send({"type": "req", "id": self._chat_request_id, "method": "chat.send", "params": params})
         return self._run_id
@@ -223,7 +245,14 @@ class OpenClawWSSession:
     def verify_history(self, session_key: str, expected: list[dict]) -> None:
         """仅在内核已持有同一历史时续聊；不把丢失的历史静默丢弃。"""
         request_id = uuid.uuid4().hex
-        self._send({"type": "req", "id": request_id, "method": "chat.history", "params": {"sessionKey": session_key}})
+        self._send(
+            {
+                "type": "req",
+                "id": request_id,
+                "method": "chat.history",
+                "params": {"sessionKey": self.session_key(session_key)},
+            }
+        )
         deadline = time.monotonic() + min(float(self.timeout), _HANDSHAKE_TIMEOUT)
         try:
             while True:
@@ -373,7 +402,7 @@ class OpenClawWSSession:
                     "type": "req",
                     "id": uuid.uuid4().hex,
                     "method": "chat.abort",
-                    "params": {"sessionKey": session_key, "runId": self._run_id},
+                    "params": {"sessionKey": self.session_key(session_key), "runId": self._run_id},
                 }
             )
             self._cancel_requested = True

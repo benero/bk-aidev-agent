@@ -146,7 +146,7 @@ class TestCrawCompletionAgent:
         sessions = []
 
         class _FakeWSSession:
-            def __init__(self, url, token, timeout):
+            def __init__(self, url, token, timeout, model="openclaw"):
                 self.url = url
                 self.token = token
                 self.timeout = timeout
