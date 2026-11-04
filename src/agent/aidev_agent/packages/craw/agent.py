@@ -24,6 +24,7 @@ from typing import Any, Callable, ClassVar, Generator, Optional
 
 from ag_ui.core import (
     BaseEvent,
+    CustomEvent,
     EventType,
     RunErrorEvent,
     RunStartedEvent,
@@ -38,6 +39,7 @@ from ag_ui.encoder import EventEncoder
 from pydantic import BaseModel, Field
 
 from aidev_agent.core.ag_ui.events import ExtendToolCallResultEvent
+from aidev_agent.core.ag_ui.types import SessionPersistenceEventNames
 from aidev_agent.enums import AgentType
 from aidev_agent.packages.craw.base import (
     CrawIdentity,
@@ -52,10 +54,11 @@ from aidev_agent.packages.craw.mcp_identity import (
     mcp_identity_lease,
     resolve_user_access_token,
 )
-from aidev_agent.packages.craw.openclaw_ws import OpenClawWSError, OpenClawWSSession
+from aidev_agent.packages.craw.openclaw_ws import OpenClawHistoryError, OpenClawWSError, OpenClawWSSession
 from aidev_agent.packages.craw.registry import CrawBackendProtocol, get_backend
 from aidev_agent.services.agent.registry import AgentBuildContext
-from aidev_agent.services.messages_handler import GeneratorStreamingHelper
+from aidev_agent.services.event_handlers.base import BaseSessionWriter
+from aidev_agent.services.messages_handler import GeneratorStreamingHelper, message_handler_factory
 from aidev_agent.utils.event import RunId, emit_run_finished_event
 
 logger = getLogger(__name__)
@@ -84,6 +87,37 @@ def build_openai_messages(session_context_data: list[dict]) -> list[dict]:
     return messages
 
 
+def build_openclaw_history(session_context_data: list[dict]) -> list[dict]:
+    """平台展示账本投影为内核历史；明确未提交的失败轮不属于内核上下文。"""
+    history = []
+    for item in session_context_data:
+        properties = item.get("property") or {}
+        builtin = item.get("builtin_property") or properties.get("builtin_property") or {}
+        if builtin.get("error_code") == "craw_not_submitted":
+            turn_id = builtin.get("turn_id") or properties.get("turn_id")
+            for index in range(len(history) - 1, -1, -1):
+                previous = history[index]
+                if previous.get("role") != "user":
+                    continue
+                previous_properties = previous.get("property") or {}
+                previous_builtin = previous.get("builtin_property") or previous_properties.get("builtin_property") or {}
+                previous_turn = previous_builtin.get("turn_id") or previous_properties.get("turn_id")
+                if not turn_id or previous_turn == turn_id:
+                    del history[index]
+                    break
+            continue
+        message_id = str(builtin.get("message_id") or "")
+        if item.get("role") in {"assistant", "ai"} and (
+            builtin.get("local_notice")
+            or (builtin.get("error") and message_id.startswith("error_"))
+            or (message_id.startswith("paused_") and item.get("content") == "用户已取消")
+        ):
+            # 仅排除 writer 明确生成的本地提示；status=error 的部分回复仍须核对。
+            continue
+        history.append(item)
+    return build_openai_messages(history)
+
+
 class CrawCompletionAgent(BaseModel):
     """把执行委托给 craw 后端的 Chat Agent（注册时覆盖 ``AgentType.CHAT``）。"""
 
@@ -104,6 +138,8 @@ class CrawCompletionAgent(BaseModel):
 
     backend: Optional[Any] = None  # CrawBackendProtocol（runtime_checkable Protocol，不做 pydantic 校验）
     identity: Optional[CrawIdentity] = None
+    # 非流式 WS 仍按事件保存工具和分段；宿主据此避免再写汇总 assistant。
+    sync_response_persisted: bool = Field(default=False, exclude=True)
 
     # 本进程内活跃上游流句柄（会话键 → 句柄列表）：stop() 据此主动关闭，
     # 立即打断阻塞中的 HTTP 读；跨进程实例仍由取消信号（is_cancelled）兜底
@@ -152,16 +188,41 @@ class CrawCompletionAgent(BaseModel):
 
     def execute(self, execute_kwargs=None) -> Any:
         """流式返回 SSE 字符串生成器；非流式返回 ChatCompletionAgent 同构 dict。"""
+        self.sync_response_persisted = False
         token = self.identity.access_token if self.identity else ""
         if bool(getattr(execute_kwargs, "stream", False)):
             thread = self.session_code or self.thread_id
-            return GeneratorStreamingHelper(thread_id=thread).stream(self._run_stream_with_mcp_lease(token))
-        with mcp_identity_lease(token):
-            return self._run_sync()
+            return GeneratorStreamingHelper(thread_id=thread).stream(
+                self._run_stream_with_mcp_lease(token, execute_kwargs),
+                attach_only=getattr(execute_kwargs, "stream_mode", "start") == "attach",
+                event_handler=self.event_handler,
+            )
+        if getattr(execute_kwargs, "stream_mode", "start") == "attach":
+            raise ValueError("attach 仅支持流式请求")
+        with mcp_identity_lease(token) as lease:
+            self._prepare_input(execute_kwargs)
+            return self._run_sync(lease)
 
-    def _run_stream_with_mcp_lease(self, token: str) -> Generator[str, None, None]:
+    def _prepare_input(self, execute_kwargs) -> None:
+        """仅由实际 producer 持久化本轮输入；attach/replay 不重复落库。"""
+        if getattr(execute_kwargs, "resume", None):
+            raise ValueError("craw 暂不支持恢复审批或用户问题中断")
+        input_text = getattr(execute_kwargs, "input", None)
+        if input_text:
+            self._dispatch(
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=SessionPersistenceEventNames.UserInputSaved.value,
+                    value={"content": input_text, "turn_id": getattr(execute_kwargs, "turn_id", None)},
+                )
+            )
+            self.session_context_data.append({"role": "user", "content": input_text})
+            self.chat_history = build_openai_messages(self.session_context_data)
+
+    def _run_stream_with_mcp_lease(self, token: str, execute_kwargs=None) -> Generator[str, None, None]:
         try:
             with mcp_identity_lease(token) as lease:
+                self._prepare_input(execute_kwargs)
                 yield from self._run_stream(lease)
         except CrawLeaseError as exc:
             # fail-closed：租约失败时终止本次运行，绝不沿用共享槽中的上一身份；
@@ -223,8 +284,10 @@ class CrawCompletionAgent(BaseModel):
     def _emit_finish(self, run_id: str) -> Generator[str, None, None]:
         yield emit_run_finished_event(thread_id=self.thread_id, run_id=run_id, event_handler=self._dispatch)
 
-    def _emit_error_and_finish(self, encoder: EventEncoder, run_id: str, message: str) -> Generator[str, None, None]:
-        error_event = RunErrorEvent(type=EventType.RUN_ERROR, message=message)
+    def _emit_error_and_finish(
+        self, encoder: EventEncoder, run_id: str, message: str, *, code: Optional[str] = None
+    ) -> Generator[str, None, None]:
+        error_event = RunErrorEvent(type=EventType.RUN_ERROR, message=message, code=code)
         self._dispatch(error_event)
         yield encoder.encode(error_event)
         yield from self._emit_finish(run_id)
@@ -241,7 +304,7 @@ class CrawCompletionAgent(BaseModel):
         if backend is not None and backend.name == "openclaw" and backend.transport == "ws":
             yield from self._run_stream_ws(lease)
             return
-        yield from self._run_stream_http()
+        yield from self._run_stream_http(lease)
 
     def _last_user_message(self) -> str:
         for item in reversed(build_openai_messages(self.session_context_data)):
@@ -280,15 +343,20 @@ class CrawCompletionAgent(BaseModel):
         text_open = False
         open_tools: set[str] = set()
         started_at: dict[str, float] = {}
-        session = OpenClawWSSession(ws_url, backend.api_key, timeout=backend.timeout)
+        session = OpenClawWSSession(ws_url, backend.api_key, timeout=backend.timeout, model=backend.model)
         run_started = False
 
         try:
             session.connect()
             self._track_stream(thread, session)
             try:
-                session.send_chat(thread, self._last_user_message())
+                messages = build_openclaw_history(self.session_context_data)
+                if not messages or messages[-1]["role"] != "user":
+                    raise OpenClawWSError("WS 对话必须以本轮用户输入结束")
+                session.verify_history(thread, messages[:-1])
+                # send 也可能在已写出请求后失败，先标记不确定态。
                 run_started = True
+                session.send_chat(thread, messages[-1]["content"])
                 for event in session.events():
                     if GeneratorStreamingHelper.is_cancelled(thread):
                         if not session.cancel_requested:
@@ -357,9 +425,13 @@ class CrawCompletionAgent(BaseModel):
                     event_handler=self._dispatch,
                 )
                 return
+            if not session.terminated:
+                raise OpenClawWSError("连接在运行终态确认前结束")
             if text_open:
                 yield from self._emit_text_end(encoder, message_id)
             yield from self._emit_finish(run_id)
+        except OpenClawHistoryError as exc:
+            yield from self._emit_error_and_finish(encoder, run_id, str(exc), code="craw_not_submitted")
         except OpenClawWSError as exc:
             logger.warning("[CRAW] OpenClaw WS unavailable: %s", exc)
             if text_open:
@@ -368,6 +440,7 @@ class CrawCompletionAgent(BaseModel):
                 encoder,
                 run_id,
                 "连接 OpenClaw 工具事件通道失败，请重试（详情见服务端日志）",
+                code=None if run_started else "craw_not_submitted",
             )
         except Exception as exc:
             logger.exception("[CRAW] OpenClaw WS stream error: %s", exc)
@@ -377,6 +450,7 @@ class CrawCompletionAgent(BaseModel):
                 encoder,
                 run_id,
                 f"转发 craw({backend.name}) 失败: {type(exc).__name__}",
+                code=None if run_started else "craw_not_submitted",
             )
         finally:
             if lease is not None and run_started and not getattr(session, "terminated", False):
@@ -421,17 +495,38 @@ class CrawCompletionAgent(BaseModel):
         if event.phase == "start" or call_id not in open_tools:
             open_tools.add(call_id)
             started_at[call_id] = time.monotonic()
+            tool_parent_id = f"craw-tool-{call_id}"
+            args = event.args if isinstance(event.args, str) else json.dumps(event.args or {}, ensure_ascii=False)
+            # 复用writer已有的内部持久化协议；START即保存，取消或失败也不会丢父关系。
+            # 每个工具独立父消息，后续正文不会覆盖tool_calls。该内部事件不编码到SSE。
+            self._dispatch(
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=SessionPersistenceEventNames.ChatModelEnd.value,
+                    value={
+                        "message_id": tool_parent_id,
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": event.tool_name or "tool", "arguments": args},
+                            }
+                        ],
+                        "deferred_tool_calls": [],
+                    },
+                )
+            )
             yield self._emit(
                 encoder,
                 ToolCallStartEvent(
                     type=EventType.TOOL_CALL_START,
                     tool_call_id=call_id,
                     tool_call_name=event.tool_name or "tool",
-                    parent_message_id=parent_message_id,
+                    parent_message_id=tool_parent_id,
                 ),
             )
             if event.args:
-                args = event.args if isinstance(event.args, str) else json.dumps(event.args, ensure_ascii=False)
                 yield self._emit(
                     encoder,
                     ToolCallArgsEvent(
@@ -461,11 +556,12 @@ class CrawCompletionAgent(BaseModel):
                     role="tool",
                     duration=duration,
                     is_error=event.is_error,
+                    tool_call_name=event.tool_name or None,
                 ),
             )
             open_tools.discard(call_id)
 
-    def _run_stream_http(self) -> Generator[str, None, None]:
+    def _run_stream_http(self, lease: Optional[McpIdentityLease] = None) -> Generator[str, None, None]:
         encoder = EventEncoder()
         run_id = str(uuid.uuid4())
         message_id = str(uuid.uuid4())
@@ -481,6 +577,7 @@ class CrawCompletionAgent(BaseModel):
             return
 
         text_open = False
+        terminated = False
         try:
             stream = backend.open_chat_stream(
                 build_openai_messages(self.session_context_data),
@@ -524,6 +621,7 @@ class CrawCompletionAgent(BaseModel):
                     thread_id=self.thread_id, run_id=RunId.CANCELLED, event_handler=self._dispatch
                 )
                 return
+            terminated = True
             if text_open:
                 yield from self._emit_text_end(encoder, message_id)
             yield from self._emit_finish(run_id)
@@ -549,22 +647,70 @@ class CrawCompletionAgent(BaseModel):
                 encoder, run_id, f"转发 craw({backend.name}) 失败: {type(exc).__name__}"
             )
 
+        finally:
+            if lease is not None and not terminated:
+                lease.quarantine()
+
     # ---------------- 非流式：转发 craw + 适配回 ChatCompletionAgent 形状 ----------------
 
-    def _run_sync(self) -> dict:
+    def _run_sync(self, lease: Optional[McpIdentityLease] = None) -> dict:
         backend: CrawBackendProtocol = self.backend
         if backend is None:
             raise RuntimeError("craw backend 未装配（检查 BKAI_CRAW_BACKEND）")
-        body = backend.chat_completions(
-            build_openai_messages(self.session_context_data),
-            identity=self.identity,
-            session_code=self.session_code,
-        )
+        if backend.name == "openclaw" and backend.transport == "ws":
+            return self._run_sync_ws(lease)
+        try:
+            body = backend.chat_completions(
+                build_openai_messages(self.session_context_data),
+                identity=self.identity,
+                session_code=self.session_code,
+            )
+        except BaseException:
+            if lease is not None:
+                lease.quarantine()
+            raise
         content = backend.message_text(body)
         # 与 ChatCompletionAgent._execute 非流式返回同构 → save_ai_response 可直接取 choices[0].delta.content
         return {
             "choices": [{"delta": {"role": "assistant", "content": content}}],
             "model": body.get("model", backend.model),
             "id": body.get("id", str(uuid.uuid4())),
+            "reference_doc": [],
+        }
+
+    def _run_sync_ws(self, lease: Optional[McpIdentityLease]) -> dict:
+        """保持同一 WS 历史协议，仅把输出方式改为同步汇总。"""
+        # 同步入口没有队列 producer 的清理阶段；新运行不得继承上一轮取消信号。
+        message_handler_factory.get().clear_cancel_signal(self.session_code or self.thread_id)
+        texts = []
+        errors = []
+        handler_errors = []
+        original_handler = self.event_handler
+
+        def collect(event: BaseEvent) -> None:
+            if event.type == EventType.TEXT_MESSAGE_CONTENT:
+                texts.append(event.delta)
+            elif event.type == EventType.RUN_ERROR:
+                errors.append(event.message)
+            if original_handler is not None:
+                try:
+                    original_handler(event)
+                except Exception as exc:
+                    handler_errors.append(exc)
+                    raise
+
+        # 独立执行副本不临时修改宿主 handler；继续复用终态确认、取消和租约隔离。
+        runner = self.model_copy(update={"event_handler": collect})
+        for _frame in runner._run_stream_ws(lease):
+            pass
+        if errors:
+            raise OpenClawWSError(errors[-1])
+        if handler_errors or (isinstance(original_handler, BaseSessionWriter) and original_handler.write_error_count):
+            raise RuntimeError("OpenClaw 回复持久化失败")
+        self.sync_response_persisted = isinstance(original_handler, BaseSessionWriter)
+        return {
+            "choices": [{"delta": {"role": "assistant", "content": "".join(texts)}}],
+            "model": self.backend.model,
+            "id": str(uuid.uuid4()),
             "reference_doc": [],
         }

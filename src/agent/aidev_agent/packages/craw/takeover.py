@@ -28,7 +28,10 @@ from __future__ import annotations
 import os
 from logging import getLogger
 
-from aidev_agent.packages.craw.registry import BACKEND_ENV, craw_backend_registry
+from aidev_agent.enums import AgentType
+from aidev_agent.packages.craw.agent import CrawCompletionAgent
+from aidev_agent.packages.craw.registry import BACKEND_ENV, craw_backend_registry, get_backend
+from aidev_agent.services.agent.registry import agent_registry
 
 logger = getLogger(__name__)
 
@@ -44,11 +47,6 @@ def enable_chat_takeover() -> bool:
     if name not in craw_backend_registry:
         raise RuntimeError(f"未注册的 {BACKEND_ENV}={name!r}（已注册: {list(craw_backend_registry.keys())}）")
     try:
-        from aidev_agent.enums import AgentType
-        from aidev_agent.packages.craw.agent import CrawCompletionAgent
-        from aidev_agent.packages.craw.registry import get_backend
-        from aidev_agent.services.agent.registry import agent_registry
-
         # 改动 registry 前完成全部校验：装配后端并取齐后续要用的属性。
         # 缺少 api_url / model 等属性的自定义后端在这里即失败，此时 registry
         # 还未被动过，不会出现「报告失败但 CHAT 已被接管」的中间态。

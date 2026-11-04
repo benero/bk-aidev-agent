@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Iterator, Optional
 
+import httpx
+
 _logger = logging.getLogger(__name__)
 
 _BOUND_TOKEN: ContextVar[str] = ContextVar("bkai_craw_user_access_token", default="")
@@ -99,16 +101,12 @@ def mcp_identity_lease(token: str) -> Iterator[McpIdentityLease]:
     egress_key = (os.getenv(EGRESS_KEY_ENV) or "").strip()
     if not egress_key:
         raise CrawLeaseError("MCP 身份出口缺少内部鉴权 key，已拒绝本次执行")
-    try:
-        import httpx
-    except ImportError as exc:
-        raise CrawLeaseError("httpx 不可用，无法建立 MCP 身份租约") from exc
     timeout = float(os.getenv("BKAI_MCP_EGRESS_LEASE_TIMEOUT", "30"))
     with httpx.Client(timeout=timeout) as client:
         try:
             response = client.post(
                 f"{base}/internal/acquire",
-                json={"token": token},
+                json={"token": token, "timeout": max(0.001, timeout / 2)},
                 headers={EGRESS_KEY_HEADER: egress_key},
             )
             response.raise_for_status()
@@ -117,6 +115,24 @@ def mcp_identity_lease(token: str) -> Iterator[McpIdentityLease]:
             raise CrawLeaseError(f"MCP 身份租约获取失败，已拒绝本次执行: {exc}") from exc
         if not lease_id:
             raise CrawLeaseError("MCP 身份租约响应缺少 leaseId，已拒绝本次执行")
+        try:
+            response = client.post(
+                f"{base}/internal/confirm",
+                json={"leaseId": lease_id},
+                headers={EGRESS_KEY_HEADER: egress_key},
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            # 已知 reservation ID，即使 confirm 的响应丢失，也能释放自己的槽。
+            try:
+                client.post(
+                    f"{base}/internal/release",
+                    json={"leaseId": lease_id},
+                    headers={EGRESS_KEY_HEADER: egress_key},
+                ).raise_for_status()
+            except Exception:
+                _logger.warning("[CRAW] MCP 租约确认失败后的回收未确认 lease=%s", lease_id)
+            raise CrawLeaseError("MCP 身份租约确认失败，已拒绝本次执行") from exc
         lease = McpIdentityLease(lease_id)
         try:
             yield lease

@@ -76,6 +76,9 @@ class AgentExecutor:
         if uses_resume_event_stream(getattr(agent_instance, "resource_manager", None), execute_kwargs):
             # The internal AG-UI producer already persisted/finalized this response.
             return result
+        if getattr(agent_instance, "sync_response_persisted", False) is True:
+            # Craw WS 同步请求也按事件保存分段正文和工具父关系，禁止再写聚合副本。
+            return result
         # 非流式 ainvoke 不经过 AG-UI 事件分发，必须显式写回 assistant
         self.session_manager.save_ai_response(session_code, result, turn_id=turn_id)
         event_handler = getattr(agent_instance, "event_handler", None)

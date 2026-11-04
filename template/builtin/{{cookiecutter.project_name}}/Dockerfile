@@ -11,7 +11,8 @@ WORKDIR /app
 # The OpenClaw base provides Python 3.11 and the package index policy. Install
 # the plugin into an isolated interpreter because the base image only contains
 # the craw kernel; it does not provide aidev-agent/aidev-bkplugin or gunicorn.
-ENV PYTHONUNBUFFERED=1 \
+ENV BKAI_CRAW_AGENT_CONFIG_VERSION={{ cookiecutter.agent_config_version | tojson }} \
+    PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_DEFAULT_INDEX=${PIP_INDEX_URL} \
     UV_LINK_MODE=copy \

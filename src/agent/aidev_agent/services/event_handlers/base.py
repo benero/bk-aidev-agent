@@ -180,6 +180,11 @@ class BaseSessionWriter(ABC):
 
     # ---------- 公共事件入口 ----------
 
+    @property
+    def write_error_count(self) -> int:
+        """本 writer 的持久化失败计数，供同步调用方确认保存结果。"""
+        return self._write_error_count
+
     def set_tools(self, tools: list | None) -> None:
         self._tools_mapping = {tool.name: tool for tool in tools} if tools else {}
 
@@ -1000,6 +1005,7 @@ class BaseSessionWriter(ABC):
             builtin_property={
                 "message_id": error_message_id,
                 "error": True,
+                **({"error_code": event.code} if event.code else {}),
             },
         )
 
@@ -1320,6 +1326,9 @@ class BaseSessionWriter(ABC):
             "message_id": message_id,
             "tool_calls": tool_calls,
         }
+        if status == "error" and content == self.PAUSED_CONTENT_MESSAGE:
+            # 此 helper 的 error 写入是本地取消提示，不属于内核 assistant 历史。
+            assistant_property["local_notice"] = True
 
         # 记录 builtin_property，以便后续追加审批 tool_calls 时合并
         self._assistant_builtin_properties[message_id] = dict(assistant_property)
@@ -1346,6 +1355,14 @@ class BaseSessionWriter(ABC):
             tool_call_id: 工具调用 ID，用于匹配延迟记录
             tool_name: 工具名称（续流 fallback 时使用）
         """
+        # 普通工具调用已由ChatModelEnd落库，不属于审批续流重建。
+        # 直接返回避免fallback把当前调用追加到旧assistant，也避免每次全量查询历史。
+        if any(
+            call.get("id") == tool_call_id
+            for properties in self._assistant_builtin_properties.values()
+            for call in properties.get("tool_calls", [])
+        ):
+            return
         matched_assistant_id = None
         matched_tool_call = None
 
