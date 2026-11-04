@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dual-process supervisor: local craw gateway + gunicorn.
+# Supervise the kernel, web process, and required loopback proxies.
 # The kernel entrypoint comes from the base image. Do not hard-code hostnames.
 set -euo pipefail
 
@@ -14,7 +14,7 @@ READY_INTERVAL="${BKAI_OPENCLAW_READY_INTERVAL:-2}"
 KERNEL_ENTRYPOINT="${BKAI_CRAW_ENTRYPOINT:-/usr/local/bin/docker-entrypoint.sh}"
 
 cleanup() {
-  trap - TERM INT
+  trap - EXIT TERM INT
   echo "[craw] shutting down child processes" >&2
   if [ -n "${WEB_PID}" ]; then
     kill -TERM "${WEB_PID}" 2>/dev/null || true
@@ -29,6 +29,32 @@ cleanup() {
     kill -TERM "${APP_IDENTITY_PID}" 2>/dev/null || true
   fi
   wait || true
+}
+
+required_children_alive() {
+  local entry name pid
+  for entry in "kernel:${OC_PID}" "gunicorn:${WEB_PID}" "MCP egress:${EGRESS_PID}" "application identity egress:${APP_IDENTITY_PID}"; do
+    name="${entry%:*}"
+    pid="${entry##*:}"
+    if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+      echo "[craw] FATAL: ${name} exited; stopping runtime" >&2
+      return 1
+    fi
+  done
+}
+
+wait_for_listener() {
+  local port="$1" name="$2"
+  for _ in $(seq 1 "${READY_ATTEMPTS}"); do
+    required_children_alive || return 1
+    if /app/.venv/bin/python -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1).close()' "${port}" 2>/dev/null; then
+      echo "[craw] ${name} listener is ready"
+      return 0
+    fi
+    sleep "${READY_INTERVAL}"
+  done
+  echo "[craw] FATAL: ${name} listener not ready after ${READY_ATTEMPTS} attempts" >&2
+  return 1
 }
 
 is_web=0
@@ -61,6 +87,7 @@ export OPENCLAW_SUPERVISOR_MODE="${OPENCLAW_SUPERVISOR_MODE:-external}"
 export OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-${HOME}/.openclaw}"
 export OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"
 CRAW_AGENT_CODE="${BKAI_AGENT:-${BKPAAS_APP_ID:-${BK_APP_CODE:-}}}"
+export BKAI_APP_IDENTITY_EGRESS_PORT="${BKAI_APP_IDENTITY_EGRESS_PORT:-18790}"
 export BKAI_MCP_EGRESS_PORT="${BKAI_MCP_EGRESS_PORT:-18787}"
 export BKAI_MCP_EGRESS_URL="${BKAI_MCP_EGRESS_URL:-http://127.0.0.1:${BKAI_MCP_EGRESS_PORT}}"
 export BKAI_MCP_EGRESS_ROUTES="${BKAI_MCP_EGRESS_ROUTES:-/tmp/craw-mcp-routes.json}"
@@ -83,6 +110,10 @@ done
 BKAI_AGENT="${CRAW_AGENT_CODE}" /app/.venv/bin/python /app/deploy/apply-agent-config.py
 # 基座看到 token 会额外执行 bkai mcp/agent apply；应用态装配已完成，显式清理避免误用手工 token。
 unset BKAI_AGENT BKAI_AIDEV_API_KEY
+# Every exit after a child is started must stop the complete runtime.
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 /app/.venv/bin/python /app/deploy/app-identity-egress.py &
 APP_IDENTITY_PID=$!
 
@@ -96,29 +127,28 @@ if [ "${BKAI_MCP_EGRESS_ENABLED:-1}" = "1" ]; then
   fi
 fi
 
+wait_for_listener "${BKAI_APP_IDENTITY_EGRESS_PORT}" "application identity egress"
+if [ -n "${EGRESS_PID}" ]; then
+  wait_for_listener "${BKAI_MCP_EGRESS_PORT}" "MCP egress"
+fi
+
 # 在内核启动前完成 MCP URL → 用户态 egress 改写，避免首轮加载到直连上游。
 if [ -n "${EGRESS_PID}" ]; then
   if ! kill -0 "${EGRESS_PID}" 2>/dev/null; then
     echo "[craw] FATAL: MCP egress exited before config rewrite" >&2
-    cleanup
     exit 1
   fi
   if [ ! -f "${OPENCLAW_CONFIG_PATH}" ]; then
     echo "[craw] FATAL: OpenClaw config missing after apply: ${OPENCLAW_CONFIG_PATH}" >&2
-    cleanup
     exit 1
   fi
   echo "[craw] rewriting MCP servers to egress via ${OPENCLAW_CONFIG_PATH}"
   if ! /app/.venv/bin/python -m aidev_agent.packages.craw.mcp_egress \
     --rewrite-only --config "${OPENCLAW_CONFIG_PATH}" --port "${BKAI_MCP_EGRESS_PORT}"; then
     echo "[craw] FATAL: MCP egress rewrite failed" >&2
-    cleanup
     exit 1
   fi
 fi
-
-trap 'cleanup; exit 143' TERM
-trap 'cleanup; exit 130' INT
 
 echo "[craw] starting kernel on 127.0.0.1:${OC_PORT}"
 "${KERNEL_ENTRYPOINT}" &
@@ -126,11 +156,7 @@ OC_PID=$!
 
 ready=0
 for _ in $(seq 1 "${READY_ATTEMPTS}"); do
-  if ! kill -0 "${OC_PID}" 2>/dev/null; then
-    echo "[craw] FATAL: kernel exited before healthz became ready" >&2
-    wait "${OC_PID}" || true
-    exit 1
-  fi
+  required_children_alive || exit 1
   if command -v curl >/dev/null 2>&1 && curl -fsS "${READY_URL}" >/dev/null 2>&1; then
     ready=1
     echo "[craw] kernel healthz is ready"
@@ -141,7 +167,6 @@ done
 
 if [ "${ready}" -ne 1 ]; then
   echo "[craw] FATAL: kernel healthz not ready after ${READY_ATTEMPTS} attempts" >&2
-  cleanup
   exit 1
 fi
 
@@ -161,14 +186,8 @@ echo "[craw] starting web process: $*"
 "$@" &
 WEB_PID=$!
 
-while kill -0 "${OC_PID}" 2>/dev/null && kill -0 "${WEB_PID}" 2>/dev/null; do
+while required_children_alive; do
   sleep 1
 done
 
-if ! kill -0 "${OC_PID}" 2>/dev/null; then
-  echo "[craw] FATAL: kernel exited; stopping gunicorn" >&2
-else
-  echo "[craw] FATAL: gunicorn exited; stopping kernel" >&2
-fi
-cleanup
 exit 1

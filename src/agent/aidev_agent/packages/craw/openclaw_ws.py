@@ -25,6 +25,11 @@ from logging import getLogger
 from typing import Generator, Optional
 from urllib.parse import urlparse
 
+try:
+    import websocket  # websocket-client
+except ImportError:
+    websocket = None
+
 logger = getLogger(__name__)
 
 # 取自内核 GATEWAY_CLIENT_IDS / GATEWAY_CLIENT_MODES / GATEWAY_CLIENT_CAPS。
@@ -89,6 +94,10 @@ class OpenClawWSError(RuntimeError):
     pass
 
 
+class OpenClawHistoryError(OpenClawWSError):
+    """历史无法安全对齐；消息均为本地生成，可直接向调用方说明恢复限制。"""
+
+
 class OpenClawWSSession:
     """一次对话 = 一条连接。用完即弃，避免跨请求共享状态。"""
 
@@ -98,6 +107,7 @@ class OpenClawWSSession:
         self.timeout = timeout
         self._ws = None
         self._run_id = ""
+        self._chat_request_id = ""
         self._closed = False
         self._cancel_requested = False
         self._terminated = False
@@ -125,10 +135,8 @@ class OpenClawWSSession:
             raise OpenClawWSError(f"网关未授予 operator.write（授予 {granted or []}）")
 
     def _handshake(self, *, with_auth: bool) -> list:
-        try:
-            import websocket  # websocket-client
-        except ImportError as exc:  # 依赖缺失时给出可操作的信息
-            raise OpenClawWSError("缺少 websocket-client 依赖，无法走 WS 传输") from exc
+        if websocket is None:
+            raise OpenClawWSError("缺少 websocket-client 依赖，无法走 WS 传输")
 
         # 必须抑制 Origin：websocket-client 默认按 URL 自动带上，网关据此判定为
         # 浏览器来源，本地后端免配对豁免随即失效——表现为带令牌时 scopes 被清空、
@@ -208,8 +216,53 @@ class OpenClawWSSession:
         }
         if agent_id:
             params["agentId"] = agent_id
-        self._send({"type": "req", "id": uuid.uuid4().hex, "method": "chat.send", "params": params})
+        self._chat_request_id = uuid.uuid4().hex
+        self._send({"type": "req", "id": self._chat_request_id, "method": "chat.send", "params": params})
         return self._run_id
+
+    def verify_history(self, session_key: str, expected: list[dict]) -> None:
+        """仅在内核已持有同一历史时续聊；不把丢失的历史静默丢弃。"""
+        request_id = uuid.uuid4().hex
+        self._send({"type": "req", "id": request_id, "method": "chat.history", "params": {"sessionKey": session_key}})
+        deadline = time.monotonic() + min(float(self.timeout), _HANDSHAKE_TIMEOUT)
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OpenClawHistoryError("核对 OpenClaw 会话历史超时")
+                self._ws.settimeout(remaining)
+                msg = self._recv_json()
+                if not msg or msg.get("type") != "res" or msg.get("id") != request_id:
+                    continue
+                if not msg.get("ok"):
+                    raise OpenClawHistoryError("无法核对 OpenClaw 会话历史，拒绝丢失历史继续执行")
+                messages = (msg.get("payload") or {}).get("messages")
+                if not isinstance(messages, list):
+                    raise OpenClawHistoryError("OpenClaw 会话历史响应格式不正确")
+                actual = []
+                for message in messages:
+                    role = message.get("role")
+                    if role not in {"user", "assistant", "system"}:
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        content = "".join(
+                            part.get("text", "")
+                            for part in content
+                            if isinstance(part, dict) and part.get("type") == "text"
+                        )
+                    if not isinstance(content, str):
+                        raise OpenClawHistoryError("OpenClaw 历史包含无法核对的消息")
+                    if content or role == "user":
+                        actual.append({"role": role, "content": content})
+                if actual != expected:
+                    raise OpenClawHistoryError(
+                        "OpenClaw 会话历史缺失或不一致，当前 WS 不支持安全恢复；请使用 HTTP 传输"
+                    )
+                return
+        finally:
+            if self._ws is not None:
+                self._ws.settimeout(self.timeout)
 
     # ---------------- 事件消费 ----------------
 
@@ -236,6 +289,8 @@ class OpenClawWSSession:
 
             mtype = msg.get("type")
             if mtype == "res":
+                if msg.get("id") != self._chat_request_id:
+                    continue
                 if not msg.get("ok"):
                     err = (msg.get("error") or {}).get("message", "unknown")
                     yield OpenClawEvent("error", text=err, raw=msg)
@@ -245,6 +300,8 @@ class OpenClawWSSession:
             if msg.get("event") != "agent":
                 continue
             payload = msg.get("payload") or {}
+            if not self._run_id or payload.get("runId") != self._run_id:
+                continue
             data = payload.get("data") or {}
             if payload.get("stream") == "lifecycle" and data.get("phase") == "end":
                 self._terminated = True

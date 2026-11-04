@@ -248,7 +248,10 @@ def main() -> int:
     defaults = openclaw.setdefault("agents", {}).setdefault("defaults", {})
     defaults["model"] = f"bkaidev/{model}"
     defaults["skipBootstrap"] = True
-    mcp_servers = openclaw.setdefault("mcp", {}).setdefault("servers", {})
+    # The platform owns this runtime's MCP list. Replacing it also removes revoked
+    # servers before the egress rewrite replaces its route table.
+    mcp_servers = {}
+    openclaw.setdefault("mcp", {})["servers"] = mcp_servers
     for mcp_code, mcp_config in (config.mcp_server_config or {}).items():
         if isinstance(mcp_config, dict):
             normalized = dict(mcp_config)

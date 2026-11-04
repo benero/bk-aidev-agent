@@ -5,6 +5,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from aidev_agent.packages.craw.mcp_egress import rewrite_openclaw_config_file
 
 TEMPLATE_DEPLOY = Path(__file__).parents[4] / "template" / "builtin" / "{{cookiecutter.project_name}}" / "deploy"
 SCRIPT = TEMPLATE_DEPLOY / "apply-agent-config.py"
@@ -73,3 +74,36 @@ def test_openclaw_2026_8_migration_removes_empty_ui(module):
     module._migrate_openclaw_2026_8(config)
 
     assert "ui" not in config
+
+
+@pytest.mark.parametrize(
+    "current_servers", [{}, {"retained": {"url": "https://mcp.example.test/new", "transport": "streamable_http"}}]
+)
+def test_main_replaces_removed_platform_mcp_and_routes(module, monkeypatch, tmp_path, current_servers):
+    config_path, routes_path = tmp_path / "openclaw.json", tmp_path / "routes.json"
+    config_path.write_text(
+        json.dumps({"mcp": {"servers": {"removed": {"url": "http://127.0.0.1:18787/egress/shared/removed/"}}}})
+    )
+    routes_path.write_text(json.dumps({"removed": "https://mcp.example.test/removed"}))
+    for name, value in {
+        "BKAI_AGENT": "demo",
+        "AIDEV_GATEWAY_NAME": "aidev",
+        "BK_APIGW_STAGE": "prod",
+        "OPENCLAW_STATE_DIR": str(tmp_path),
+        "OPENCLAW_CONFIG_PATH": str(config_path),
+        "BKAI_MCP_EGRESS_ROUTES": str(routes_path),
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("BKAI_CRAW_SKILLS_ONLY", raising=False)
+    config = SimpleNamespace(chat_model="model", mcp_server_config=current_servers)
+    monkeypatch.setattr(module, "AgentResourceManager", lambda: SimpleNamespace(get_agent_config=lambda code: config))
+    monkeypatch.setattr(module, "render_soul", lambda config: "soul")
+    assert module.main() == 0
+    applied = json.loads(config_path.read_text())["mcp"]["servers"]
+    assert set(applied) == set(current_servers)
+    if current_servers:
+        assert applied["retained"]["transport"] == "streamable-http"
+    rewrite_openclaw_config_file(str(config_path), "http://127.0.0.1:18787", egress_key="test")
+    routes = json.loads(routes_path.read_text())
+    assert "removed" not in routes
+    assert list(routes.values()) == [item["url"] for item in current_servers.values()]

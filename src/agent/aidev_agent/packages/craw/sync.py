@@ -433,7 +433,9 @@ class CrawSyncer:
         results: "list[CrawSyncResult]" = []
         cycle = 0
         while max_cycles is None or cycle < max_cycles:
-            results.append(self.run_cycle())
+            result = self.run_cycle()
+            if max_cycles is not None:
+                results.append(result)
             cycle += 1
             if max_cycles is not None and cycle >= max_cycles:
                 break
