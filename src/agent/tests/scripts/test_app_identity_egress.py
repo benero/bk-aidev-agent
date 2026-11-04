@@ -1,6 +1,8 @@
 import io
+import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -80,3 +82,23 @@ def test_proxy_sends_identity_only_to_final_allowed_url(proxy):
     assert requests[0].headers["X-Bkapi-Authorization"] == '{"bk_app_code":"test-app","bk_app_secret":"test-secret"}'
     assert "Authorization" not in requests[0].headers
     assert handler.wfile.getvalue() == b"ok"
+
+
+@pytest.mark.parametrize("finish_reason,tool_call", [(None, False), (None, True), ("stop", False)])
+def test_chat_done_completes_without_waiting_for_http_eof(proxy, finish_reason, tool_call):
+    handler, _, _ = proxy
+    delta = {"tool_calls": [{"id": "call-1"}]} if tool_call else {"content": "answer"}
+    event = {"id": "test", "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+
+    def lines():
+        yield "data: " + json.dumps(event)
+        yield ""
+        yield "data: [DONE]"
+        raise AssertionError("must not wait for HTTP EOF after protocol completion")
+
+    handler._relay_chat_stream(SimpleNamespace(iter_lines=lines))
+    output = handler.wfile.getvalue()
+    assert output.endswith(b"data: [DONE]\n\n")
+    assert output.count(b"data: [DONE]") == 1
+    expected_reason = "tool_calls" if tool_call else "stop"
+    assert output.count(f'"finish_reason": "{expected_reason}"'.encode()) == 1

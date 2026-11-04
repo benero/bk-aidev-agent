@@ -8,6 +8,7 @@ OC_PID=""
 WEB_PID=""
 EGRESS_PID=""
 APP_IDENTITY_PID=""
+SKILLS_PID=""
 READY_URL="http://127.0.0.1:${OC_PORT}/healthz"
 READY_ATTEMPTS="${BKAI_OPENCLAW_READY_ATTEMPTS:-90}"
 READY_INTERVAL="${BKAI_OPENCLAW_READY_INTERVAL:-2}"
@@ -16,6 +17,9 @@ KERNEL_ENTRYPOINT="${BKAI_CRAW_ENTRYPOINT:-/usr/local/bin/docker-entrypoint.sh}"
 cleanup() {
   trap - EXIT TERM INT
   echo "[craw] shutting down child processes" >&2
+  if [ -n "${SKILLS_PID}" ]; then
+    kill -TERM "${SKILLS_PID}" 2>/dev/null || true
+  fi
   if [ -n "${WEB_PID}" ]; then
     kill -TERM "${WEB_PID}" 2>/dev/null || true
   fi
@@ -172,8 +176,8 @@ fi
 
 # OpenClaw scans its native managed Skills directory per run. Sync after healthz so
 # a missing or malformed optional Skill never takes down the web process.
-(BKAI_CRAW_SKILLS_ONLY=1 /app/.venv/bin/python /app/deploy/apply-agent-config.py || \
-  echo "[craw] WARN: Skill sync failed; continuing without new Skills" >&2) &
+BKAI_CRAW_SKILLS_ONLY=1 /app/.venv/bin/python /app/deploy/apply-agent-config.py &
+SKILLS_PID=$!
 
 if [ -x /app/.venv/bin/python ]; then
   (cd /app && /app/.venv/bin/python bin/manage.py migrate --noinput) || \
@@ -187,6 +191,10 @@ echo "[craw] starting web process: $*"
 WEB_PID=$!
 
 while required_children_alive; do
+  if [ -n "${SKILLS_PID}" ] && ! kill -0 "${SKILLS_PID}" 2>/dev/null; then
+    wait "${SKILLS_PID}" || echo "[craw] WARN: Skill sync failed; continuing without new Skills" >&2
+    SKILLS_PID=""
+  fi
   sleep 1
 done
 

@@ -491,17 +491,38 @@ class CrawCompletionAgent(BaseModel):
         if event.phase == "start" or call_id not in open_tools:
             open_tools.add(call_id)
             started_at[call_id] = time.monotonic()
+            tool_parent_id = f"craw-tool-{call_id}"
+            args = event.args if isinstance(event.args, str) else json.dumps(event.args or {}, ensure_ascii=False)
+            # 复用writer已有的内部持久化协议；START即保存，取消或失败也不会丢父关系。
+            # 每个工具独立父消息，后续正文不会覆盖tool_calls。该内部事件不编码到SSE。
+            self._dispatch(
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name=SessionPersistenceEventNames.ChatModelEnd.value,
+                    value={
+                        "message_id": tool_parent_id,
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": event.tool_name or "tool", "arguments": args},
+                            }
+                        ],
+                        "deferred_tool_calls": [],
+                    },
+                )
+            )
             yield self._emit(
                 encoder,
                 ToolCallStartEvent(
                     type=EventType.TOOL_CALL_START,
                     tool_call_id=call_id,
                     tool_call_name=event.tool_name or "tool",
-                    parent_message_id=parent_message_id,
+                    parent_message_id=tool_parent_id,
                 ),
             )
             if event.args:
-                args = event.args if isinstance(event.args, str) else json.dumps(event.args, ensure_ascii=False)
                 yield self._emit(
                     encoder,
                     ToolCallArgsEvent(
@@ -531,6 +552,7 @@ class CrawCompletionAgent(BaseModel):
                     role="tool",
                     duration=duration,
                     is_error=event.is_error,
+                    tool_call_name=event.tool_name or None,
                 ),
             )
             open_tools.discard(call_id)

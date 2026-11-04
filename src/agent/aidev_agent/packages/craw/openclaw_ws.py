@@ -356,6 +356,8 @@ class OpenClawWSSession:
         next_poll = 0.0
         while True:
             now = time.monotonic()
+            if self._run_deadline is not None:
+                deadline = min(deadline, self._run_deadline)
             if now >= deadline:
                 yield OpenClawEvent("error", text="等待内核运行终态超时")
                 return
@@ -371,7 +373,9 @@ class OpenClawWSSession:
                 )
                 next_poll = now + _TERMINAL_POLL_INTERVAL
             if self._ws is not None:
-                read_timeout = deadline - now
+                # 短轮询让另一个线程的abort截止时间在阻塞recv后也能及时生效；
+                # 不依赖跨线程settimeout能否中断已经进入的socket读取。
+                read_timeout = min(deadline - now, _TERMINAL_POLL_INTERVAL)
                 if candidate is not None:
                     read_timeout = min(read_timeout, max(0.01, next_poll - now))
                 self._ws.settimeout(read_timeout)
@@ -380,9 +384,8 @@ class OpenClawWSSession:
             except Exception as exc:
                 if self._closed:
                     return
-                if candidate is not None and (
-                    isinstance(exc, TimeoutError)
-                    or (websocket is not None and isinstance(exc, websocket.WebSocketTimeoutException))
+                if isinstance(exc, TimeoutError) or (
+                    websocket is not None and isinstance(exc, websocket.WebSocketTimeoutException)
                 ):
                     # 一个wait快照响应丢失后允许下一次查询；全程受绝对期限约束。
                     wait_request_id = ""

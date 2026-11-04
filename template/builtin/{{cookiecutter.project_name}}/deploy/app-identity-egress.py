@@ -140,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = line[5:].strip()
                 if data == "[DONE]":
                     pending_done = True
-                    continue
+                    break
                 try:
                     event = _loads(data)
                 except Exception:
