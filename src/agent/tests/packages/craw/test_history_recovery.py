@@ -91,6 +91,16 @@ def test_connection_failure_does_not_permanently_poison_next_turn(monkeypatch, m
 
         def send(self, text):
             request = json.loads(text)
+            if request["method"] == "agent.wait":
+                self.messages.append(
+                    {
+                        "type": "res",
+                        "id": request["id"],
+                        "ok": True,
+                        "payload": {"runId": request["params"]["runId"], "status": "ok"},
+                    }
+                )
+                return
             assert request["params"]["sessionKey"] == expected_key
             if request["method"] == "chat.history":
                 self.messages.append(

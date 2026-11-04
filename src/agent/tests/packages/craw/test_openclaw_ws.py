@@ -68,24 +68,25 @@ def test_lifecycle_failure_is_not_reported_as_done():
     assert cancelled.kind == "cancelled"
 
 
-def test_events_marks_lifecycle_end_as_confirmed_termination():
-    class FakeWS:
-        def recv(self):
-            return json.dumps(
-                {
-                    "event": "agent",
-                    "payload": {
-                        "runId": "active",
-                        "stream": "lifecycle",
-                        "data": {"phase": "end", "stopReason": "aborted"},
-                    },
-                }
-            )
-
-    session = OpenClawWSSession("ws://127.0.0.1:18789/", "token")
-    session._ws = FakeWS()
-
+def test_events_marks_confirmed_cancel_as_termination(monkeypatch):
+    session = OpenClawWSSession("ws://localhost", "token")
     session._run_id = "active"
+    messages = [
+        {
+            "event": "agent",
+            "payload": {"runId": "active", "stream": "lifecycle", "data": {"phase": "end", "stopReason": "aborted"}},
+        }
+    ]
+
+    def send(request):
+        assert request["method"] == "agent.wait"
+        assert not session.terminated
+        messages.append(
+            {"type": "res", "id": request["id"], "ok": True, "payload": {"runId": "active", "status": "ok"}}
+        )
+
+    monkeypatch.setattr(session, "_send", send)
+    monkeypatch.setattr(session, "_recv_json", lambda: messages.pop(0))
     assert [event.kind for event in session.events()] == ["cancelled"]
     assert session.terminated is True
 
@@ -123,7 +124,7 @@ def test_events_ignore_foreign_run_and_unrelated_response(monkeypatch, foreign_r
     session = OpenClawWSSession("ws://localhost", "token")
     session._run_id = "active"
     session._chat_request_id = "request"
-    messages = iter(
+    messages = list(
         [
             {"type": "res", "id": "other-request", "ok": False},
             {"event": "agent", "payload": {"runId": foreign_run, "stream": "assistant", "data": {"delta": "secret"}}},
@@ -132,7 +133,14 @@ def test_events_ignore_foreign_run_and_unrelated_response(monkeypatch, foreign_r
             {"event": "agent", "payload": {"runId": "active", "stream": "lifecycle", "data": {"phase": "end"}}},
         ]
     )
-    monkeypatch.setattr(session, "_recv_json", lambda: next(messages))
+
+    def send(request):
+        messages.append(
+            {"type": "res", "id": request["id"], "ok": True, "payload": {"runId": "active", "status": "ok"}}
+        )
+
+    monkeypatch.setattr(session, "_send", send)
+    monkeypatch.setattr(session, "_recv_json", lambda: messages.pop(0))
     assert [(event.kind, event.text) for event in session.events()] == [("text", "answer"), ("done", "")]
     assert session.terminated
 
@@ -168,7 +176,7 @@ def test_history_must_match_before_sending(actual, expected, ok):
     else:
         with pytest.raises(OpenClawWSError, match="不支持安全恢复"):
             session.verify_history("session-1", expected)
-    assert session._ws.request["method"] == "chat.history"
+    assert session._ws.request["method"] == ("chat.history" if ok else "sessions.get")
 
 
 @pytest.mark.parametrize(
