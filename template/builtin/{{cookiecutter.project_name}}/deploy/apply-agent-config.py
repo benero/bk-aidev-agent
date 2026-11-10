@@ -67,10 +67,15 @@ def _install_skill(manager: AgentResourceManager, skill: dict, skills_root: Path
     callee_agent_code = skill.get("callee_agent_code") or None
     slug = _skill_slug(skill)
     print(f"[craw] syncing skill {slug}: resolve application download", file=sys.stderr)
+    config_version = os.getenv("BKAI_CRAW_AGENT_CONFIG_VERSION", "").strip()
+    current_agent_code = os.getenv("BKAI_AGENT") or os.getenv("BKPAAS_APP_ID") or os.getenv("BK_APP_CODE")
+    is_current_agent = not callee_agent_code or callee_agent_code == current_agent_code
+    download_context = {"params": {"agent_version": config_version}} if config_version and is_current_agent else {}
     download = manager.retrieve_skill_download(
         str(skill_id),
         version=version,
         callee_agent_code=callee_agent_code,
+        **download_context,
     )
     download_url = download.get("url")
     if not download_url:
@@ -152,14 +157,15 @@ def materialize_skills(
         if not isinstance(skill, dict):
             continue
         slug = _skill_slug(skill)
-        expected.add(slug)
         try:
             installed.append(_install_skill(manager, skill, skills_root))
+            expected.add(slug)
         except Exception as exc:
             error = _error_code(exc)
             failures.append({"skill": slug, "error": error})
             print(f"[craw] WARN: skipped skill {slug}: {error}", file=sys.stderr)
 
+    # A failed refresh must not leave a previous release's managed Skill loadable.
     for child in skills_root.iterdir():
         metadata_path = child / _MANAGED_META
         if not child.is_dir() or child.name in expected or not metadata_path.is_file():
@@ -206,7 +212,12 @@ def main() -> int:
         return 4
 
     manager = AgentResourceManager()
-    config = manager.get_agent_config(agent_code)
+    config_version = os.getenv("BKAI_CRAW_AGENT_CONFIG_VERSION", "").strip()
+    config = (
+        manager.get_agent_config(agent_code, version=config_version)
+        if config_version
+        else manager.get_agent_config(agent_code)
+    )
     model = (config.chat_model or "").strip()
     if not model:
         print(f"agent {agent_code} has no chat model", file=sys.stderr)
@@ -248,7 +259,11 @@ def main() -> int:
     defaults = openclaw.setdefault("agents", {}).setdefault("defaults", {})
     defaults["model"] = f"bkaidev/{model}"
     defaults["skipBootstrap"] = True
-    mcp_servers = openclaw.setdefault("mcp", {}).setdefault("servers", {})
+    # The platform owns this runtime's MCP list. Replacing it also removes revoked
+    # servers before the egress rewrite replaces its route table.
+    openclaw.pop("mcpServers", None)
+    mcp_servers = {}
+    openclaw.setdefault("mcp", {})["servers"] = mcp_servers
     for mcp_code, mcp_config in (config.mcp_server_config or {}).items():
         if isinstance(mcp_config, dict):
             normalized = dict(mcp_config)

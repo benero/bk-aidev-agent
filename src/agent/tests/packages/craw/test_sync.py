@@ -2,6 +2,7 @@
 """CrawSyncer：周期读写（health 打桩 + tmp_path 文件面）。"""
 
 import json
+import weakref
 
 import pytest
 from aidev_agent.packages.craw import (
@@ -323,3 +324,23 @@ class TestCustomSoulFilename:
         )
         by_env.run_cycle()
         assert ((tmp_path / "ENV.md").stat().st_mode & 0o777) == 0o640
+
+
+def test_unbounded_sync_does_not_retain_cycle_history(monkeypatch):
+    syncer = CrawSyncer(backend=_HealthStubBackend(), interval=0)
+    results = []
+
+    class CycleResult:
+        pass
+
+    def run_cycle():
+        if len(results) == 3:
+            assert results[0]() is None
+            raise StopIteration("stop test loop")
+        result = CycleResult()
+        results.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(syncer, "run_cycle", run_cycle)
+    with pytest.raises(StopIteration, match="stop test loop"):
+        syncer.run_forever()

@@ -18,12 +18,18 @@
 
 import ipaddress
 import json
+import re
 import time
 import uuid
 from contextlib import suppress
 from logging import getLogger
 from typing import Generator, Optional
 from urllib.parse import urlparse
+
+try:
+    import websocket  # websocket-client
+except ImportError:
+    websocket = None
 
 logger = getLogger(__name__)
 
@@ -36,6 +42,9 @@ _CAP_TOOL_EVENTS = "tool-events"
 
 _HANDSHAKE_TIMEOUT = 20.0
 _ABORT_TIMEOUT = 10.0
+_HISTORY_LIMIT = 1000
+_HISTORY_MAX_CHARS = 500_000
+_TERMINAL_POLL_INTERVAL = 1.0
 _SUCCESS_STOP_REASONS = {"", "complete", "completed", "end_turn", "stop", "success"}
 _CANCEL_STOP_REASONS = {"abort", "aborted", "cancel", "cancelled", "canceled"}
 
@@ -89,18 +98,25 @@ class OpenClawWSError(RuntimeError):
     pass
 
 
+class OpenClawHistoryError(OpenClawWSError):
+    """历史无法安全对齐；消息均为本地生成，可直接向调用方说明恢复限制。"""
+
+
 class OpenClawWSSession:
     """一次对话 = 一条连接。用完即弃，避免跨请求共享状态。"""
 
-    def __init__(self, url: str, token: str, timeout: float = 300.0):
+    def __init__(self, url: str, token: str, timeout: float = 300.0, *, model: str = "openclaw"):
         self.url = url
         self.token = token
         self.timeout = timeout
+        self.model = model
         self._ws = None
         self._run_id = ""
+        self._chat_request_id = ""
         self._closed = False
         self._cancel_requested = False
         self._terminated = False
+        self._run_deadline = None
 
     # ---------------- 连接与握手 ----------------
 
@@ -125,10 +141,8 @@ class OpenClawWSSession:
             raise OpenClawWSError(f"网关未授予 operator.write（授予 {granted or []}）")
 
     def _handshake(self, *, with_auth: bool) -> list:
-        try:
-            import websocket  # websocket-client
-        except ImportError as exc:  # 依赖缺失时给出可操作的信息
-            raise OpenClawWSError("缺少 websocket-client 依赖，无法走 WS 传输") from exc
+        if websocket is None:
+            raise OpenClawWSError("缺少 websocket-client 依赖，无法走 WS 传输")
 
         # 必须抑制 Origin：websocket-client 默认按 URL 自动带上，网关据此判定为
         # 浏览器来源，本地后端免配对豁免随即失效——表现为带令牌时 scopes 被清空、
@@ -196,20 +210,133 @@ class OpenClawWSSession:
         except ValueError:
             return None  # ping 等非 JSON 帧不该中断消费
 
-    def send_chat(self, session_key: str, message: str, *, agent_id: str = "") -> str:
+    def session_key(self, session_key: str) -> str:
+        """与 OpenClaw http-utils 的 routing model 别名保持一致。
+
+        chat.* schema 不接受 agentId；Agent 通过 agent:<id>:<session> 选择。
+        裸键由网关解析配置的默认 Agent，不能在 SDK 中假定默认名为 main。
+        """
+        model = self.model.strip().lower()
+        if model in {"", "openclaw", "openclaw/default"}:
+            if session_key.lower().startswith("agent:"):
+                raise OpenClawWSError("默认 Agent 模型不能与显式 Agent 会话键混用")
+            return session_key
+        match = re.fullmatch(r"(?:openclaw[:/]|agent:)([a-z0-9][a-z0-9_-]{0,63})", model)
+        if not match:
+            raise OpenClawWSError("WS model 必须使用 openclaw 或 openclaw/<agentId> 别名")
+        agent_id = match.group(1)
+        if session_key.lower().startswith("agent:"):
+            parts = session_key.split(":", 2)
+            if len(parts) != 3 or parts[1].lower() != agent_id or not parts[2]:
+                raise OpenClawWSError("model 与会话键的 Agent 不一致")
+            return f"agent:{agent_id}:{parts[2]}"
+        return f"agent:{agent_id}:{session_key}"
+
+    def send_chat(self, session_key: str, message: str) -> str:
         """发起一次对话，返回本次 run 的 id（用于过滤事件）。"""
         self._run_id = str(uuid.uuid4())
         self._cancel_requested = False
         self._terminated = False
         params = {
-            "sessionKey": session_key,
+            "sessionKey": self.session_key(session_key),
             "message": message,
             "idempotencyKey": self._run_id,
         }
-        if agent_id:
-            params["agentId"] = agent_id
-        self._send({"type": "req", "id": uuid.uuid4().hex, "method": "chat.send", "params": params})
+        self._run_deadline = time.monotonic() + self.timeout
+        self._chat_request_id = uuid.uuid4().hex
+        self._send({"type": "req", "id": self._chat_request_id, "method": "chat.send", "params": params})
         return self._run_id
+
+    def _read_history(self, session_key: str, *, raw: bool, deadline: float) -> list[dict]:
+        request_id = uuid.uuid4().hex
+        params = {"key" if raw else "sessionKey": self.session_key(session_key), "limit": _HISTORY_LIMIT}
+        if not raw:
+            params["maxChars"] = _HISTORY_MAX_CHARS
+        self._send(
+            {"type": "req", "id": request_id, "method": "sessions.get" if raw else "chat.history", "params": params}
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OpenClawHistoryError("核对 OpenClaw 会话历史超时")
+            self._ws.settimeout(remaining)
+            msg = self._recv_json()
+            if not msg or msg.get("type") != "res" or msg.get("id") != request_id:
+                continue
+            if not msg.get("ok"):
+                raise OpenClawHistoryError("无法核对 OpenClaw 会话历史，拒绝丢失历史继续执行")
+            messages = (msg.get("payload") or {}).get("messages")
+            if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+                raise OpenClawHistoryError("OpenClaw 会话历史响应格式不正确")
+            return messages
+
+    @staticmethod
+    def _history_matches(messages: list[dict], expected: list[dict], *, raw: bool) -> bool:
+        actual = []
+        for message in messages:
+            metadata = message.get("__openclaw") or {}
+            if metadata.get("truncated"):
+                return False
+            if metadata.get("kind") == "compaction":
+                continue
+            role = message.get("role")
+            if role not in {"user", "assistant", "system"}:
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
+                )
+            if not isinstance(content, str):
+                return False
+            if content or role == "user":
+                actual.append({"role": role, "content": content})
+
+        target = expected
+        if raw and len(messages) == _HISTORY_LIMIT:
+            # seq 是 readSessionMessages 从1开始逐条赋予的源序号，含tool/compaction。
+            # 只有完整、连续、达到请求上限的原始窗口才能证明前缀由RPC裁去。
+            sequence = [(item.get("__openclaw") or {}).get("seq") for item in messages]
+            if all(isinstance(seq, int) and not isinstance(seq, bool) for seq in sequence):
+                first = sequence[0]
+                if first > 1 and sequence == list(range(first, first + _HISTORY_LIMIT)):
+                    if not actual or len(actual) > len(expected):
+                        return False
+                    target = expected[-len(actual) :]
+        if len(actual) != len(target):
+            return False
+        for observed, wanted in zip(actual, target):
+            if observed == wanted:
+                continue
+            if not raw or observed["role"] != "user" or wanted["role"] != "user":
+                return False
+            # chat.send唯一自动注入的前缀（agent-timestamp.ts）；不复制UI清洗器，
+            # 也不对任意文本作endswith匹配。原文相等优先，用户自带时间戳不会被删。
+            unstamped = re.sub(
+                r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}(?:[^\]\r\n]*)\] ",
+                "",
+                observed["content"],
+                count=1,
+            )
+            if unstamped != wanted["content"]:
+                return False
+        return True
+
+    def verify_history(self, session_key: str, expected: list[dict]) -> None:
+        """核验最多1000条原始记录窗口；展示裁剪不被误认成内核丢历史。"""
+        deadline = time.monotonic() + min(float(self.timeout), _HANDSHAKE_TIMEOUT)
+        try:
+            messages = self._read_history(session_key, raw=False, deadline=deadline)
+            if self._history_matches(messages, expected, raw=False):
+                return
+            # chat.history有文本、工具和总字节展示裁剪。用同一有限窗口的只读原始
+            # sessions.get回退，不信占位符，也不盲目信任相等后缀。
+            messages = self._read_history(session_key, raw=True, deadline=deadline)
+            if not self._history_matches(messages, expected, raw=True):
+                raise OpenClawHistoryError("OpenClaw 会话历史缺失或不一致，当前 WS 不支持安全恢复；请使用 HTTP 传输")
+        finally:
+            if self._ws is not None:
+                self._ws.settimeout(self.timeout)
 
     # ---------------- 事件消费 ----------------
 
@@ -222,45 +349,137 @@ class OpenClawWSSession:
         return self._terminated
 
     def events(self) -> Generator[OpenClawEvent, None, None]:
-        """产出本次 run 的事件，直到运行结束或出错。"""
+        """消费run事件；attempt终态还需agent.wait零等待快照确认整个chat已结束。"""
+        deadline = self._run_deadline or (time.monotonic() + self.timeout)
+        candidate = None
+        wait_request_id = ""
+        next_poll = 0.0
+        received_text = False
         while True:
+            now = time.monotonic()
+            if self._run_deadline is not None:
+                deadline = min(deadline, self._run_deadline)
+            if now >= deadline:
+                yield OpenClawEvent("error", text="等待内核运行终态超时")
+                return
+            if candidate is not None and now >= next_poll:
+                wait_request_id = uuid.uuid4().hex
+                self._send(
+                    {
+                        "type": "req",
+                        "id": wait_request_id,
+                        "method": "agent.wait",
+                        "params": {"runId": self._run_id, "timeoutMs": 0},
+                    }
+                )
+                next_poll = now + _TERMINAL_POLL_INTERVAL
+            if self._ws is not None:
+                # 短轮询让另一个线程的abort截止时间在阻塞recv后也能及时生效；
+                # 不依赖跨线程settimeout能否中断已经进入的socket读取。
+                read_timeout = min(deadline - now, _TERMINAL_POLL_INTERVAL)
+                if candidate is not None:
+                    read_timeout = min(read_timeout, max(0.01, next_poll - now))
+                self._ws.settimeout(read_timeout)
             try:
                 msg = self._recv_json()
             except Exception as exc:
                 if self._closed:
                     return
+                if isinstance(exc, TimeoutError) or (
+                    websocket is not None and isinstance(exc, websocket.WebSocketTimeoutException)
+                ):
+                    # 一个wait快照响应丢失后允许下一次查询；全程受绝对期限约束。
+                    wait_request_id = ""
+                    continue
                 yield OpenClawEvent("error", text=f"连接中断: {exc}")
                 return
             if msg is None:
                 continue
 
-            mtype = msg.get("type")
-            if mtype == "res":
-                if not msg.get("ok"):
+            if msg.get("type") == "res":
+                if wait_request_id and msg.get("id") == wait_request_id:
+                    wait_request_id = ""
+                    if not msg.get("ok"):
+                        yield OpenClawEvent("error", text="无法确认内核运行终态")
+                        return
+                    payload = msg.get("payload") or {}
+                    if payload.get("runId") != self._run_id:
+                        yield OpenClawEvent("error", text="内核运行终态标识不匹配")
+                        return
+                    status = payload.get("status")
+                    if status in {"ok", "error"}:
+                        self._terminated = True
+                        if status == "error":
+                            yield OpenClawEvent("error", text=str(payload.get("error") or "OpenClaw运行失败"))
+                        else:
+                            # chat dedupe 的 ok 只确认 dispatch 返回；模型 isError
+                            # payload 也可正常返回，业务结果仍由最后一个候选决定。
+                            yield candidate if candidate is not None else OpenClawEvent("done")
+                        return
+                    if status != "timeout":
+                        yield OpenClawEvent("error", text="未知的内核运行终态")
+                        return
+                    continue
+                if msg.get("id") == self._chat_request_id and not msg.get("ok"):
                     err = (msg.get("error") or {}).get("message", "unknown")
                     yield OpenClawEvent("error", text=err, raw=msg)
                     return
                 continue
 
+            if msg.get("event") == "chat":
+                payload = msg.get("payload") or {}
+                if payload.get("runId") == self._run_id:
+                    state = payload.get("state")
+                    if state in {"final", "error", "aborted"}:
+                        if state == "final" and not received_text:
+                            # /help 等命令没有 agent delta，只在 final 提供正文；
+                            # 普通 agent 的 final 是已输出正文快照，不重复发送。
+                            message = payload.get("message") or {}
+                            content = message.get("content") if isinstance(message, dict) else None
+                            if isinstance(content, list):
+                                content = "".join(
+                                    part.get("text", "")
+                                    for part in content
+                                    if isinstance(part, dict) and part.get("type") == "text"
+                                )
+                            if isinstance(content, str) and content:
+                                received_text = True
+                                yield OpenClawEvent("text", text=content, raw=payload)
+                        candidate = OpenClawEvent(
+                            {"final": "done", "error": "error", "aborted": "cancelled"}[state],
+                            text=str(payload.get("errorMessage") or ""),
+                        )
+                continue
             if msg.get("event") != "agent":
                 continue
             payload = msg.get("payload") or {}
+            if not self._run_id or payload.get("runId") != self._run_id:
+                continue
             data = payload.get("data") or {}
-            if payload.get("stream") == "lifecycle" and data.get("phase") == "end":
-                self._terminated = True
+            if payload.get("stream") == "lifecycle" and data.get("phase") == "start":
+                # 模型fallback/重试开始；旧attempt error不可作为最终结果。
+                candidate = None
+                wait_request_id = ""
             event = self._translate(payload)
             if event is None:
                 continue
+            if event.kind in {"done", "cancelled", "error"}:
+                if event.kind == "done" and candidate is not None and candidate.kind == "error":
+                    # 同一 attempt 的收尾不撤销已报告的业务失败；只有新 start
+                    # 或后续 chat.final 才能替代这一错误候选。
+                    continue
+                candidate = event
+                continue
+            if event.kind == "text":
+                received_text = True
             yield event
-            if event.kind in ("done", "cancelled", "error"):
-                return
 
     def _translate(self, payload: dict) -> Optional[OpenClawEvent]:
         """把网关 agent 事件翻成中立事件。
 
         实测的帧词汇（``stream`` / ``data.phase``）：
 
-        - ``lifecycle`` start|end —— 唯一的运行边界；``end`` 带 ``stopReason``。
+        - ``lifecycle`` start|end|error 是attempt边界；整个chat终态由agent.wait核验。
           别拿其它流的 ``phase == "end"`` 当运行结束，那只是单个条目收尾。
         - ``assistant`` —— 正文增量在 ``data.delta``，**不带 phase**。
         - ``tool`` start|update|result —— ``result`` 阶段才带 ``data.result``
@@ -273,6 +492,13 @@ class OpenClawWSSession:
         phase = data.get("phase") or ""
 
         if stream == "lifecycle":
+            if phase == "error":
+                return OpenClawEvent(
+                    "error",
+                    text=str(data.get("error") or data.get("message") or "OpenClaw运行失败"),
+                    phase=phase,
+                    raw=payload,
+                )
             if phase == "end":
                 stop_reason = str(data.get("stopReason") or "").strip().lower()
                 error = data.get("error") or data.get("message")
@@ -316,10 +542,12 @@ class OpenClawWSSession:
                     "type": "req",
                     "id": uuid.uuid4().hex,
                     "method": "chat.abort",
-                    "params": {"sessionKey": session_key, "runId": self._run_id},
+                    "params": {"sessionKey": self.session_key(session_key), "runId": self._run_id},
                 }
             )
             self._cancel_requested = True
+            abort_deadline = time.monotonic() + _ABORT_TIMEOUT
+            self._run_deadline = min(self._run_deadline or abort_deadline, abort_deadline)
             if self._ws is not None:
                 self._ws.settimeout(min(float(self.timeout), _ABORT_TIMEOUT))
             return True
