@@ -1,0 +1,14 @@
+FROM python:3.11-slim-bookworm
+
+# PaaS supplies the runtime entrypoint when provisioning the user sandbox.
+WORKDIR /opt/adapter
+RUN apt-get update && apt-get install -y --no-install-recommends npm ca-certificates git \
+    && npm install --global node@24.22.3 \
+    && node --version && npm install --global openclaw@2026.11.6 \
+    && npm cache clean --force && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml readme.md ./
+COPY aidev_agent_adapter/ ./aidev_agent_adapter/
+RUN pip install --no-cache-dir .
+COPY examples/openclaw/demo.py ./demo.py
+RUN useradd --create-home adapter && install -d -o adapter -g adapter -m 700 /var/lib/aidev-adapter
+USER adapter
