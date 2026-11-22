@@ -123,3 +123,11 @@ OpenClaw 的 `openclaw acp` 是连接现有 Gateway 的桥接进程，并不启�
 测试用模拟 AIDev HTTP 接口和真实 stdio JSON-RPC 测试进程，覆盖配置同步、资源移除、失败回退、鉴权隔离、工具过滤、归档攻击、事件转换、断线续传、请求去重、取消和重启恢复。
 
 未使用真实平台凭据，未运行 OpenClaw / Hermes 模型调用，也未验证 PaaS 实例与 Channel WSS 链路。部署验收须补充：真实网关路由与用户授权、固定引擎版本的配置加载、带依赖的 Skill、MCP 工具权限及外部副作用。
+
+## OpenClaw 用户沙箱 demo
+
+在插件目录使用 `examples/openclaw/Dockerfile` 构建镜像。镜像内同时安装社区稳定版 OpenClaw 2026.11.6 和 Agent Adapter。按租户、智能体和用户分配沙箱与私有存储。平台负责创建实例，宿主只提交请求。
+
+将 `examples/openclaw/config.example.json` 中的平台地址、智能体、发布版本和模型入口替换为个人环境配置，挂载到沙箱内的 `/run/aidev/config.json`。凭据由部署端注入。设置 `openclaw_model_provider` 后，Adapter 从发布版本的 `prompt_setting.llm_code` 选择模型。沿用原生 MCP 配置路径。
+
+一次 demo 从标准输入读取 Chat。沙箱入口先同步配置，再启动仅监听回环地址的 Gateway 和 ACP bridge。Adapter 将 ACP 更新转换为逐行 AG-UI JSON，并在结束时关闭进程。标准输出只包含事件；可续传的外层信封由 Adapter Journal 保存。此入口用于验证单轮请求，Runner WSS 和 Session WSS 需由通道接入端提供。

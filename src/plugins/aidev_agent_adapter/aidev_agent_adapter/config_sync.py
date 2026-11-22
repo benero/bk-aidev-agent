@@ -191,6 +191,8 @@ class ConfigSynchronizer:
                     (s["id"], s["version"], s.get("skill_code"), hashlib.sha256(b).hexdigest()) for s, b in packages
                 ],
             }
+            if bundle.model_code:
+                identity["model"] = [self.settings.openclaw_model_provider, bundle.model_code]
             revision = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
             final = self.root / revision
             self._render(stage, final, bundle, packages)
@@ -266,7 +268,17 @@ class ConfigSynchronizer:
         config = json.loads(json.dumps(self.settings.native_config))
         servers = render_mcp(bundle.mcp_servers, self.settings.engine)
         if self.settings.engine == "openclaw":
-            config.setdefault("agents", {}).setdefault("defaults", {})["workspace"] = str(final / "workspace")
+            defaults = config.setdefault("agents", {}).setdefault("defaults", {})
+            defaults["workspace"] = str(final / "workspace")
+            if bundle.model_code:
+                name = self.settings.openclaw_model_provider
+                provider = config.get("models", {}).get("providers", {}).get(name)
+                if not isinstance(provider, dict) or not provider.get("baseUrl"):
+                    raise PlatformError("configure a trusted OpenClaw model provider first")
+                provider.setdefault("headers", {})["X-Model-Name"] = bundle.model_code
+                provider["models"] = [{"id": bundle.model_code, "name": bundle.model_code}]
+                defaults["model"] = f"{name}/{bundle.model_code}"
+                defaults["skipBootstrap"] = True
             config.setdefault("mcp", {})["servers"] = servers
             write_private(stage / "openclaw.json", json.dumps(config, ensure_ascii=False, indent=2))
         else:

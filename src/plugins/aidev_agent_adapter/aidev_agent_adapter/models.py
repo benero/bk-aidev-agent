@@ -34,6 +34,8 @@ class Settings(BaseModel):
     command: list[str] | None = Field(default=None, min_length=1)
     # 子进程仅继承明确的引擎环境；不继承 Adapter 的平台身份。
     engine_env: dict[str, str] = Field(default_factory=dict, repr=False)
+    # Enable platform model selection for a deployment-owned OpenClaw provider.
+    openclaw_model_provider: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_-]+$")
     native_config: dict = Field(default_factory=dict, repr=False)
 
     @property
@@ -62,6 +64,7 @@ class Settings(BaseModel):
 class Bundle(BaseModel):
     agent_code: str
     version: str
+    model_code: str | None = None
     prompt: str | None = None
     mcp_servers: dict[str, dict] = Field(default_factory=dict, repr=False)
     skills: list[dict] = Field(default_factory=list, repr=False)

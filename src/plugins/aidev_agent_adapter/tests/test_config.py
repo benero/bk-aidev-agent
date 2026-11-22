@@ -160,3 +160,25 @@ def test_archive_rejects_unsafe_content(tmp_path, issue):
 def test_unsupported_mcp_rejected(server):
     with pytest.raises((ValueError, PlatformError)):
         render_mcp({"server": server}, "openclaw")
+
+
+async def test_openclaw_uses_platform_model(settings, platform, api_data):
+    settings.openclaw_model_provider = "bkaidev"
+    settings.native_config = {"models": {"providers": {"bkaidev": {"baseUrl": "https://model.example/v1"}}}}
+    sync = ConfigSynchronizer(settings, platform)
+    try:
+        revisions = []
+        for model in ["model-A", "model-B"]:
+            api_data["agent"]["prompt_setting"]["llm_code"] = model
+            snapshot = await sync.sync()
+            revisions.append(snapshot.revision)
+            config = json.loads((snapshot.path / "openclaw.json").read_text())
+            assert config["agents"]["defaults"]["model"] == "bkaidev/" + model
+            assert config["models"]["providers"]["bkaidev"]["headers"]["X-Model-Name"] == model
+        assert revisions[0] != revisions[1]
+        del api_data["agent"]["prompt_setting"]["llm_code"]
+        with pytest.raises(PlatformError):
+            await sync.sync()
+        assert (settings.root / "current").resolve() == snapshot.path
+    finally:
+        await platform.close()

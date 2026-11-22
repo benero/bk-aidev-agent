@@ -116,7 +116,15 @@ class PlatformClient:
             if skill.get("id") != skill_id or skill.get("version") != expected:
                 raise PlatformError("Skill identity/version mismatch")
             skills.append(skill)
+        model_code = None
+        if settings.openclaw_model_provider:
+            model_code = (data.get("prompt_setting") or {}).get("llm_code")
+            if settings.engine != "openclaw" or not isinstance(model_code, str) or not model_code.strip():
+                raise PlatformError("OpenClaw platform model selection requires a bound model")
+            if not model_code.isascii() or not model_code.isprintable() or model_code != model_code.strip():
+                raise PlatformError("invalid platform model code")
         return Bundle(
+            model_code=model_code,
             agent_code=settings.agent_code,
             version=settings.version,
             prompt=prompt if settings.include_prompt else None,
