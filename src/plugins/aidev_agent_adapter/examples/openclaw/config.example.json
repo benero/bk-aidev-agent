@@ -8,6 +8,7 @@
   "root": "/var/lib/aidev-adapter/demo",
   "openclaw_model_provider": "bkaidev",
   "native_config": {
+    "plugins": {"allow": ["openai"]},
     "gateway": {"mode": "local"},
     "models": {"providers": {"bkaidev": {
       "baseUrl": "https://model-gateway.example.com/v1",
