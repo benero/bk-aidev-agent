@@ -72,6 +72,12 @@ class Journal:
     def contains(self, run_id: str) -> bool:
         return self.db.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None
 
+    def belongs_to(self, run_id: str, thread_id: str) -> bool:
+        return (
+            self.db.execute("SELECT 1 FROM runs WHERE run_id=? AND thread_id=?", (run_id, thread_id)).fetchone()
+            is not None
+        )
+
     def claim(self, run_id: str, thread_id: str, request: dict) -> bool:
         for value in (run_id, thread_id):
             if not value or len(value) > 200 or any(c in value for c in "\r\n\x00"):

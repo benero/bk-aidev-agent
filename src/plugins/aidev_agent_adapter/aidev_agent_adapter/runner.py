@@ -1,0 +1,134 @@
+"""由用户沙箱发起管控连接，每个业务会话使用独立的 WSS。"""
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
+
+from .adapter import Adapter
+
+logger = logging.getLogger(__name__)
+
+
+class DirectConnection(connect):
+    def process_redirect(self, exc):
+        # Registration credentials are valid only for the configured Channel origin.
+        return exc
+
+
+async def send_frame(socket, kind, **fields):
+    await socket.send(json.dumps({"type": kind, **fields}, ensure_ascii=False))
+
+
+def origin(url):
+    target = urlsplit(url)
+    if target.scheme != "wss" or not target.hostname or target.username or target.password or target.fragment:
+        raise ValueError("expected a secure Channel URL")
+    return target.hostname, target.port or 443
+
+
+async def serve_session(adapter, url, session, ticket, epoch):
+    async with DirectConnection(url, max_size=2**21) as socket:
+        await send_frame(socket, "session.register", session_code=session, ticket=ticket, epoch=epoch)
+        registered = json.loads(await asyncio.wait_for(socket.recv(), 15))
+        if registered.get("type") != "session.ready" or registered.get("epoch") != epoch:
+            raise ValueError("session registration rejected")
+
+        async def stream(run_id, after):
+            async for envelope in adapter.events(run_id, after):
+                await send_frame(socket, "session.event", **envelope)
+
+        sender = None
+        try:
+            async for raw in socket:
+                frame = json.loads(raw)
+                kind = frame["type"]
+                if kind == "session.close":
+                    return
+                if kind == "event.ack":
+                    continue
+                run_id = frame["run_id"]
+                if kind == "chat.cancel":
+                    if adapter.journal.belongs_to(run_id, session):
+                        await adapter.cancel(run_id)
+                    continue
+                if kind not in {"chat.submit", "chat.resume"}:
+                    raise ValueError("unsupported session frame")
+                if sender and not sender.done():
+                    await send_frame(socket, "session.busy", run_id=run_id)
+                    continue
+                if sender:
+                    await sender
+                if kind == "chat.submit":
+                    await adapter.submit(run_id, session, frame["text"])
+                if not adapter.journal.belongs_to(run_id, session):
+                    await send_frame(socket, "session.unknown", run_id=run_id)
+                    continue
+                after = frame.get("after", 0)
+                if type(after) is not int or after < 0:
+                    raise ValueError("invalid replay cursor")
+                sender = asyncio.create_task(stream(run_id, after))
+        finally:
+            if sender:
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
+
+
+async def serve_runner(adapter: Adapter, url: str, ticket_file: Path, sandbox_id: str):
+    expected_origin = origin(url)
+    sessions = {}
+
+    def finish(key, done):
+        if sessions.get(key) is done:
+            sessions.pop(key)
+        if not done.cancelled() and done.exception() is not None:
+            logger.warning("Session connection closed before completion")
+
+    delay = 1
+    try:
+        while True:
+            try:
+                async with DirectConnection(url, max_size=65536) as socket:
+                    await send_frame(
+                        socket, "runner.register", sandbox_id=sandbox_id, ticket=ticket_file.read_text().strip()
+                    )
+                    ready = json.loads(await asyncio.wait_for(socket.recv(), 15))
+                    if ready.get("type") != "runner.ready":
+                        raise ValueError("runner registration rejected")
+                    epoch = ready["epoch"]
+                    delay = 1
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(socket.recv(), 15)
+                        except TimeoutError:
+                            await send_frame(socket, "runner.heartbeat", epoch=epoch)
+                            continue
+                        frame = json.loads(raw)
+                        if frame.get("epoch") != epoch or frame.get("type") != "session.open":
+                            continue
+                        session = frame["session_code"]
+                        if origin(frame["url"]) != expected_origin:
+                            raise ValueError("session origin mismatch")
+                        task = sessions.get(session)
+                        if task and not task.done():
+                            # Session tickets belong to a connection epoch.
+                            if task.get_name() == str(epoch):
+                                continue
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                        sessions[session] = asyncio.create_task(
+                            serve_session(adapter, frame["url"], session, frame["ticket"], epoch), name=str(epoch)
+                        )
+                        sessions[session].add_done_callback(lambda done, key=session: finish(key, done))
+            except (ConnectionClosed, OSError, TimeoutError):
+                await asyncio.sleep(delay)
+                delay = min(30, delay * 2)
+    finally:
+        pending = list(sessions.values())
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)

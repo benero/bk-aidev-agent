@@ -24,6 +24,7 @@ def origin(url: str) -> str:
 
 class PlatformClient:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
+        self.preview_config: dict | None = None
         self.settings = settings
         origin(settings.endpoint)
         if urlsplit(settings.endpoint).query:
@@ -70,7 +71,9 @@ class PlatformClient:
 
     async def fetch(self) -> Bundle:
         settings = self.settings
-        data = await self.get(f"agent/{quote(settings.agent_app_code, safe='')}/", {"version": settings.version})
+        data = self.preview_config
+        if data is None:
+            data = await self.get(f"agent/{quote(settings.agent_app_code, safe='')}/", {"version": settings.version})
         if data.get("allowed_access") is not True:
             raise PlatformError("agent access is not authorized")
         if data.get("agent_code") != settings.agent_app_code:
