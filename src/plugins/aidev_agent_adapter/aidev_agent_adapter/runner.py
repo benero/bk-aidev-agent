@@ -12,6 +12,7 @@ from websockets.exceptions import ConnectionClosed
 from .adapter import Adapter
 
 logger = logging.getLogger(__name__)
+HEARTBEAT_INTERVAL = 15.0
 
 
 class DirectConnection(connect):
@@ -101,11 +102,17 @@ async def serve_runner(adapter: Adapter, url: str, ticket_file: Path, sandbox_id
                         raise ValueError("runner registration rejected")
                     epoch = ready["epoch"]
                     delay = 1
+                    loop = asyncio.get_running_loop()
+                    next_heartbeat = loop.time() + HEARTBEAT_INTERVAL
                     while True:
-                        try:
-                            raw = await asyncio.wait_for(socket.recv(), 15)
-                        except TimeoutError:
+                        remaining = next_heartbeat - loop.time()
+                        if remaining <= 0:
                             await send_frame(socket, "runner.heartbeat", epoch=epoch)
+                            next_heartbeat = loop.time() + HEARTBEAT_INTERVAL
+                            continue
+                        try:
+                            raw = await asyncio.wait_for(socket.recv(), remaining)
+                        except TimeoutError:
                             continue
                         frame = json.loads(raw)
                         if frame.get("epoch") != epoch or frame.get("type") != "session.open":

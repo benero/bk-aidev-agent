@@ -3,6 +3,7 @@ import json
 import ssl
 import subprocess
 
+from aidev_agent_adapter import runner as runner_module
 from aidev_agent_adapter.runner import send_frame, serve_runner
 from websockets.asyncio.server import serve
 
@@ -97,3 +98,40 @@ async def test_runner_opens_session_and_resumes_on_separate_socket(adapter, tmp_
         finally:
             runner.cancel()
             await asyncio.gather(runner, return_exceptions=True)
+
+
+async def test_busy_control_connection_still_sends_heartbeats(tmp_path, monkeypatch):
+    interval = 0.05
+    messages = asyncio.Queue()
+
+    class BusyControl:
+        registered = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def send(self, raw):
+            await messages.put(json.loads(raw))
+
+        async def recv(self):
+            if not self.registered:
+                self.registered = True
+                return json.dumps({"type": "runner.ready", "epoch": 3})
+            await asyncio.sleep(interval / 10)
+            return json.dumps({"type": "session.open", "epoch": 2})
+
+    monkeypatch.setattr(runner_module, "HEARTBEAT_INTERVAL", interval)
+    monkeypatch.setattr(runner_module, "DirectConnection", lambda *args, **kwargs: BusyControl())
+    ticket = tmp_path / "ticket"
+    ticket.write_text("test-ticket")
+    task = asyncio.create_task(serve_runner(None, "wss://channel.example/runner", ticket, "instance"))
+    try:
+        assert (await asyncio.wait_for(messages.get(), 1))["type"] == "runner.register"
+        for _ in range(2):
+            assert await asyncio.wait_for(messages.get(), 1) == {"type": "runner.heartbeat", "epoch": 3}
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
