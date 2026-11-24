@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir aidev-agent-adapter==0.2.0 \
+    && /opt/venv/bin/pip install --no-cache-dir --index-url https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple aidev-agent-adapter==0.2.0 \
     && /opt/venv/bin/aidev-openclaw-adapter --help
 RUN useradd --create-home adapter
 USER adapter
