@@ -1,7 +1,9 @@
 """ACP 客户端与可续传的 AG-UI 事件输出，不包含 Channel Server 协议。"""
 
 import asyncio
+import re
 from contextlib import AsyncExitStack, suppress
+from pathlib import Path
 
 from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process, text_block
 from acp.schema import ClientCapabilities, RequestPermissionResponse
@@ -10,6 +12,8 @@ from .config_sync import Snapshot, private_directory
 from .events import EventMapper
 from .journal import Journal
 from .models import Settings
+
+SESSION_VOLUME = Path("/app/.storage/session")
 
 
 class Adapter:
@@ -26,6 +30,13 @@ class Adapter:
         self._closed = False
         self._broken = False
         self._mapping_failed = asyncio.Event()
+
+    def session_directory(self, thread_id: str) -> Path:
+        if not self.settings.mounted_storage:
+            return self.snapshot.workspace
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", thread_id):
+            raise ValueError("invalid session code")
+        return private_directory(SESSION_VOLUME / thread_id)
 
     async def _connect(self) -> None:
         if self._broken:
@@ -46,7 +57,7 @@ class Adapter:
                 self,
                 *command,
                 env=environment,
-                cwd=self.snapshot.workspace,
+                cwd=Path("/app/workspace") if self.settings.mounted_storage else self.snapshot.workspace,
                 transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
             )
         )
@@ -121,7 +132,9 @@ class Adapter:
             async with asyncio.timeout(self.settings.prompt_timeout):
                 await self._connect()
                 if thread_id not in self._sessions:
-                    session = await self._connection.new_session(cwd=str(self.snapshot.workspace), mcp_servers=[])
+                    session = await self._connection.new_session(
+                        cwd=str(self.session_directory(thread_id)), mcp_servers=[]
+                    )
                     self._sessions[thread_id] = session.session_id
                 session_id = self._sessions[thread_id]
                 self._active = (session_id, mapper)

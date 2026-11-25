@@ -20,6 +20,7 @@ class Settings(BaseModel):
     app_secret: SecretStr = SecretStr("")
     version: str = Field(min_length=1)
     engine: Literal["openclaw", "hermes"]
+    mounted_storage: bool = False
     root: Path
     mcp_names: list[str] | None = None
     skill_ids: list[int] | None = None

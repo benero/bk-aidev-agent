@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from aidev_agent_adapter.adapter import Adapter
@@ -18,8 +19,29 @@ from aidev_agent_adapter.platform import PlatformClient
 from aidev_agent_adapter.runner import serve_runner
 
 
+def install_user_config(settings, snapshot, user_root):
+    # Persist configuration separately from SQLite. Credentials are resolved per sandbox start.
+    config = json.loads((snapshot.path / "openclaw.json").read_text())
+    for index, server in enumerate(config.get("mcp", {}).get("servers", {}).values()):
+        for position, (key, value) in enumerate(server.get("headers", {}).items()):
+            variable = f"AIDEV_MCP_{index}_HEADER_{position}"
+            settings.engine_env[variable] = value
+            server["headers"][key] = "${" + variable + "}"
+    target = user_root / "openclaw.json"
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=user_root, delete=False) as tmp:
+        stage = Path(tmp.name)
+        try:
+            json.dump(config, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            os.replace(stage, target)
+        finally:
+            stage.unlink(missing_ok=True)
+    return replace(snapshot, engine_config=target)
+
+
 async def run(config: Path, prompt: str | None) -> None:
-    if sys.platform != "linux" or Path.cwd().resolve() != Path("/opt/adapter"):
+    if sys.platform != "linux" or Path.cwd().resolve() not in {Path("/opt/adapter"), Path("/app/workspace")}:
         raise RuntimeError("use the OpenClaw sandbox image entrypoint")
     settings = load_settings(config)
     if settings.engine != "openclaw" or (prompt is not None and not prompt.strip()):
@@ -36,12 +58,19 @@ async def run(config: Path, prompt: str | None) -> None:
     finally:
         await client.close()
 
+    if settings.mounted_storage:
+        snapshot = install_user_config(settings, snapshot, Path("/app/.storage/user"))
+
     # Both processes share the same user-private state, token and immutable config.
     settings.engine_env.update(
         {
             "PATH": os.environ["PATH"],
             "HOME": str(private_directory(settings.root / "engine-home")),
-            "OPENCLAW_STATE_DIR": str(private_directory(settings.root / "openclaw-state")),
+            "OPENCLAW_STATE_DIR": str(
+                private_directory(
+                    Path("/app/.storage/user/state") if settings.mounted_storage else settings.root / "openclaw-state"
+                )
+            ),
             "OPENCLAW_GATEWAY_TOKEN": secrets.token_urlsafe(32),
         }
     )

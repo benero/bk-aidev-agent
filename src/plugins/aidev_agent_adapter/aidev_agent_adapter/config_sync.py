@@ -20,6 +20,7 @@ import yaml
 from .models import Bundle, Settings
 from .platform import PlatformClient, PlatformError, origin
 
+AGENT_VOLUME = Path("/app/.storage/agent")
 NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
@@ -135,6 +136,7 @@ class Snapshot:
     path: Path
     revision: str
     engine: str
+    engine_config: Path | None = None
 
     @property
     def workspace(self) -> Path:
@@ -143,7 +145,7 @@ class Snapshot:
     @property
     def environment(self) -> dict[str, str]:
         if self.engine == "openclaw":
-            return {"OPENCLAW_CONFIG_PATH": str(self.path / "openclaw.json")}
+            return {"OPENCLAW_CONFIG_PATH": str(self.engine_config or self.path / "openclaw.json")}
         return {"HERMES_HOME": str(self.path)}
 
 
@@ -174,6 +176,21 @@ class ConfigSynchronizer:
                 packages = [(skill, await self.platform.download(skill)) for skill in bundle.skills]
                 return self._publish(bundle, packages)
 
+    def _shared_workspace(self) -> Path | None:
+        if not self.settings.mounted_storage or self.platform.preview_config is not None:
+            return None
+        shared = (AGENT_VOLUME / "current").resolve(strict=True)
+        if shared.parent != AGENT_VOLUME / "revisions" or not re.fullmatch(r"[a-f0-9]{64}", shared.name):
+            raise PlatformError("invalid platform resource revision")
+        manifest = yaml.safe_load((shared / "agent.yaml").read_text())
+        if (manifest["tenant_id"], manifest["agent_code"], manifest["version"]) != (
+            self.settings.tenant_id,
+            self.settings.agent_code,
+            self.settings.version,
+        ):
+            raise PlatformError("platform resource revision belongs to a different agent or version")
+        return shared
+
     def _publish(self, bundle: Bundle, packages: list[tuple[dict, bytes]]) -> Snapshot:
         stage = Path(tempfile.mkdtemp(prefix=".staging-", dir=self.root))
         try:
@@ -191,11 +208,14 @@ class ConfigSynchronizer:
                     (s["id"], s["version"], s.get("skill_code"), hashlib.sha256(b).hexdigest()) for s, b in packages
                 ],
             }
+            shared = self._shared_workspace()
+            if shared:
+                identity["resource_revision"] = shared.name
             if bundle.model_code:
                 identity["model"] = [self.settings.openclaw_model_provider, bundle.model_code]
             revision = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
             final = self.root / revision
-            self._render(stage, final, bundle, packages)
+            self._render(stage, final, bundle, packages, shared)
             write_private(
                 stage / "manifest.json",
                 json.dumps(
@@ -254,7 +274,9 @@ class ConfigSynchronizer:
                 ):
                     raise ValueError("managed snapshot was modified")
 
-    def _render(self, stage: Path, final: Path, bundle: Bundle, packages: list[tuple[dict, bytes]]) -> None:
+    def _render(
+        self, stage: Path, final: Path, bundle: Bundle, packages: list[tuple[dict, bytes]], shared: Path | None
+    ) -> None:
         (stage / "workspace").mkdir(mode=0o700)
         prompt_dir = stage / "workspace" if self.settings.engine == "openclaw" else stage
         if bundle.prompt is not None:
@@ -270,6 +292,9 @@ class ConfigSynchronizer:
         if self.settings.engine == "openclaw":
             defaults = config.setdefault("agents", {}).setdefault("defaults", {})
             defaults["workspace"] = str(final / "workspace")
+            if shared is not None:
+                defaults["workspace"] = str(shared)
+                defaults["skipBootstrap"] = True
             if bundle.model_code:
                 name = self.settings.openclaw_model_provider
                 provider = config.get("models", {}).get("providers", {}).get(name)

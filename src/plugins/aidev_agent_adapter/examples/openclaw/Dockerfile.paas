@@ -1,5 +1,5 @@
 FROM python:3.11-slim-bookworm
-WORKDIR /opt/adapter
+WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git \
     && cd /tmp \
@@ -7,12 +7,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && curl -fsSLo node-sums https://nodejs.org/dist/v24.22.3/SHASUMS256.txt \
     && grep -F '  node-v24.22.3-linux-x64.tar.gz' node-sums | sha256sum -c - \
     && tar xzf node-v24.22.3-linux-x64.tar.gz --strip-components=1 -C /usr/local \
-    && npm install --global --no-audit --no-fund openclaw@2026.11.6 \
+    && npm install --prefix /app/runtime --no-audit --no-fund openclaw@2026.11.6 \
+    && ln -s /app/runtime/node_modules/.bin/openclaw /usr/local/bin/openclaw \
     && npm cache clean --force && rm -f node-v24.22.3-linux-x64.tar.gz node-sums \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --index-url https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple aidev-agent-adapter==0.2.0 \
-    && /opt/venv/bin/aidev-openclaw-adapter --help
-RUN useradd --create-home adapter
+RUN python -m venv /app/.venv \
+    && /app/.venv/bin/pip install --no-cache-dir --index-url https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple aidev-agent-adapter==0.2.1 \
+    && /app/.venv/bin/aidev-openclaw-adapter --help
+RUN useradd --uid 1000 --create-home adapter \
+    && install -d /app/.storage/agent /app/.storage/user /app/.storage/session \
+    && install -d -o adapter -g adapter -m 700 /app/workspace
+ENV OPENCLAW_STATE_DIR=/app/.storage/user/state
+WORKDIR /app/workspace
 USER adapter

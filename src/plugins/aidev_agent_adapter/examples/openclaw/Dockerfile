@@ -5,14 +5,17 @@ RUN npm install --global openclaw@${OPENCLAW_VERSION} && npm cache clean --force
 
 FROM python:3.11-slim-bookworm
 COPY --from=engine /usr/local/bin/node /usr/local/bin/node
-COPY --from=engine /usr/local/lib/node_modules/openclaw /usr/local/lib/node_modules/openclaw
-RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw
+COPY --from=engine /usr/local/lib/node_modules/openclaw /app/runtime/openclaw
+RUN ln -s /app/runtime/openclaw/openclaw.mjs /usr/local/bin/openclaw
 WORKDIR /opt/adapter
 COPY pyproject.toml readme.md ./
 COPY aidev_agent_adapter/ ./aidev_agent_adapter/
-RUN pip install --no-cache-dir .
+RUN python -m venv /app/.venv && /app/.venv/bin/pip install --no-cache-dir .
 COPY examples/openclaw/demo.py /opt/adapter/demo.py
-RUN useradd --create-home adapter && install -d -o adapter -g adapter -m 700 /var/lib/aidev-adapter
+RUN useradd --create-home adapter && install -d -o adapter -g adapter -m 700 /var/lib/aidev-adapter /app/workspace \
+    && install -d /app/.storage/agent /app/.storage/user /app/.storage/session
 USER adapter
-ENTRYPOINT ["python","/opt/adapter/demo.py"]
+WORKDIR /app/workspace
+ENV OPENCLAW_STATE_DIR=/app/.storage/user/state
+ENTRYPOINT ["/app/.venv/bin/aidev-openclaw-adapter"]
 CMD ["--config","/run/aidev/config.json"]
