@@ -1,6 +1,6 @@
 [project]
 name = "aidev-agent-adapter"
-version = "0.2.3"
+version = "0.2.4"
 description = "AIDev configuration sync and ACP to AG-UI adapter"
 readme = "readme.md"
 requires-python = ">=3.11"

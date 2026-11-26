@@ -17,6 +17,7 @@ import httpx
 from aidev_agent_adapter.adapter import Adapter
 from aidev_agent_adapter.cli import load_settings
 from aidev_agent_adapter.config_sync import ConfigSynchronizer, private_directory
+from aidev_agent_adapter.gateway_recovery import recover_confirmed_owner
 from aidev_agent_adapter.platform import PlatformClient
 from aidev_agent_adapter.runner import serve_runner
 
@@ -104,6 +105,9 @@ async def run(config: Path, prompt: str | None) -> None:
     adapter = Adapter(settings, snapshot)
     gateway = None
     try:
+        if prompt is None and settings.mounted_storage:
+            exited_hosts = os.environ.get("CHANNEL_CONFIRMED_EXITED_GATEWAYS", "").split()
+            await recover_confirmed_owner(binary, env, exited_hosts)
         gateway = await asyncio.create_subprocess_exec(
             binary,
             "gateway",
