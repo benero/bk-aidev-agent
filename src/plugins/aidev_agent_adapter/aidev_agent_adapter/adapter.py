@@ -24,12 +24,12 @@ class Adapter:
         self._stack = AsyncExitStack()
         self._connection = None
         self._sessions: dict[str, str] = {}
-        self._active: tuple[str, EventMapper] | None = None
+        self._active: dict[str, tuple[EventMapper, asyncio.Event]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
-        self._serial = asyncio.Lock()
+        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._connect_lock = asyncio.Lock()
         self._closed = False
-        self._broken = False
-        self._mapping_failed = asyncio.Event()
+        self._unrecoverable: set[str] = set()
 
     def session_directory(self, thread_id: str) -> Path:
         if not self.settings.mounted_storage:
@@ -39,8 +39,6 @@ class Adapter:
         return private_directory(SESSION_VOLUME / thread_id)
 
     async def _connect(self) -> None:
-        if self._broken:
-            raise RuntimeError("ACP connection quarantined; restart adapter and use a new thread")
         if self._connection is not None:
             return
         command = self.settings.command or [self.settings.engine, "acp"]
@@ -52,27 +50,32 @@ class Adapter:
             "OPENCLAW_HIDE_BANNER": "1",
             "OPENCLAW_SUPPRESS_NOTES": "1",
         }
-        self._connection, _ = await self._stack.enter_async_context(
-            spawn_agent_process(
-                self,
-                *command,
-                env=environment,
-                cwd=Path("/app/workspace") if self.settings.mounted_storage else self.snapshot.workspace,
-                transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
+        async with AsyncExitStack() as startup:
+            connection, _ = await startup.enter_async_context(
+                spawn_agent_process(
+                    self,
+                    *command,
+                    env=environment,
+                    cwd=Path("/app/workspace") if self.settings.mounted_storage else self.snapshot.workspace,
+                    transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
+                )
             )
-        )
-        await self._connection.initialize(protocol_version=PROTOCOL_VERSION, client_capabilities=ClientCapabilities())
+            await connection.initialize(protocol_version=PROTOCOL_VERSION, client_capabilities=ClientCapabilities())
+            self._stack.push_async_callback(startup.pop_all().aclose)
+        self._connection = connection
 
     async def request_permission(self, session_id, tool_call, options, **kwargs):
         # 第一版不提供自动授权；后续由 Channel 接入显式用户确认。
         return RequestPermissionResponse(outcome={"outcome": "cancelled"})
 
     async def session_update(self, session_id, update, **kwargs) -> None:
-        if self._active and self._active[0] == session_id:
+        active = self._active.get(session_id)
+        if active:
+            mapper, mapping_failed = active
             try:
-                self._active[1].update(update)
+                mapper.update(update)
             except Exception:
-                self._mapping_failed.set()
+                mapping_failed.set()
 
     async def ext_method(self, method, params):
         raise RequestError.method_not_found(method)
@@ -115,7 +118,7 @@ class Adapter:
 
     async def _execute(self, run_id: str, thread_id: str, text: str) -> None:
         try:
-            async with self._serial:
+            async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
                 await self._run_locked(run_id, thread_id, text)
         except asyncio.CancelledError:
             # 取消发生在获取串行锁之前，也需要完整 RUN_STARTED / RUN_ERROR。
@@ -124,52 +127,48 @@ class Adapter:
 
     async def _run_locked(self, run_id: str, thread_id: str, text: str) -> None:
         mapper = EventMapper(self.journal, run_id, thread_id)
-        self._mapping_failed.clear()
+        mapping_failed = asyncio.Event()
+        session_id = None
         try:
-            if thread_id not in self._sessions and self.journal.has_thread(thread_id, run_id):
+            if thread_id in self._unrecoverable or (
+                thread_id not in self._sessions and self.journal.has_thread(thread_id, run_id)
+            ):
                 self.journal.abort(run_id, "SESSION_NOT_RECOVERABLE", "ACP session context cannot be recovered")
                 return
             async with asyncio.timeout(self.settings.prompt_timeout):
-                await self._connect()
+                async with self._connect_lock:
+                    await self._connect()
                 if thread_id not in self._sessions:
                     session = await self._connection.new_session(
                         cwd=str(self.session_directory(thread_id)), mcp_servers=[]
                     )
                     self._sessions[thread_id] = session.session_id
                 session_id = self._sessions[thread_id]
-                self._active = (session_id, mapper)
-                self._mapping_failed.clear()
+                self._active[session_id] = (mapper, mapping_failed)
                 self.journal.mark_dispatched(run_id)
-                response = await self._prompt(session_id, text)
+                response = await self._prompt(session_id, text, mapping_failed)
                 mapper.finish(response.stop_reason)
         except asyncio.CancelledError:
-            self._broken = True
+            self._unrecoverable.add(thread_id)
             self.journal.abort(run_id, "EXECUTION_UNKNOWN", "ACP execution cancelled; outcome unknown")
             raise
         except Exception:
-            self._broken = True
-            code = "EVENT_MAPPING_FAILED" if self._mapping_failed.is_set() else "EXECUTION_UNKNOWN"
+            self._unrecoverable.add(thread_id)
+            code = "EVENT_MAPPING_FAILED" if mapping_failed.is_set() else "EXECUTION_UNKNOWN"
             self.journal.abort(run_id, code, "ACP execution interrupted; outcome unknown")
         finally:
-            # cancel、断连和子进程清理完成后才允许下一个任务取得串行锁。
-            if self._broken:
-                if self._active and self._connection:
+            if session_id is not None:
+                self._active.pop(session_id, None)
+                if thread_id in self._unrecoverable:
                     with suppress(Exception):
-                        await asyncio.wait_for(self._connection.cancel(session_id=self._active[0]), timeout=2)
-                try:
-                    await self._stack.aclose()
-                finally:
-                    self._connection = None
-                    self._active = None
-            else:
-                self._active = None
+                        await asyncio.wait_for(self._connection.cancel(session_id=session_id), timeout=2)
 
-    async def _prompt(self, session_id: str, text: str):
+    async def _prompt(self, session_id: str, text: str, mapping_failed: asyncio.Event):
         prompt = asyncio.create_task(self._connection.prompt(session_id=session_id, prompt=[text_block(text)]))
-        failed = asyncio.create_task(self._mapping_failed.wait())
+        failed = asyncio.create_task(mapping_failed.wait())
         try:
             await asyncio.wait({prompt, failed}, return_when=asyncio.FIRST_COMPLETED)
-            if self._mapping_failed.is_set():
+            if mapping_failed.is_set():
                 raise RuntimeError("ACP event conversion failed")
             return await prompt
         finally:

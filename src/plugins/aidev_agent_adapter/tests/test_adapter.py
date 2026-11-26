@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from acp.schema import AgentMessageChunk, TextContentBlock
@@ -52,7 +53,7 @@ async def test_transport_failure_is_terminal_and_not_retried(adapter, text):
     assert events[-1]["event"]["type"] == "RUN_ERROR"
     assert events[-1]["event"]["code"] == "EXECUTION_UNKNOWN"
     assert await collect(adapter, text=text) == events
-    second = await collect(adapter, run_id="r2", thread_id="t2")
+    second = await collect(adapter, run_id="r2", thread_id="t1")
     assert second[-1]["event"]["type"] == "RUN_ERROR"
 
 
@@ -150,7 +151,7 @@ async def test_restart_replays_old_run_but_rejects_lost_thread(adapter):
 async def test_foreign_acp_session_cannot_contaminate_run(adapter):
     await adapter.submit("r1", "t1", "slow")
     async with asyncio.timeout(2):
-        while adapter._active is None:
+        while not adapter._active:
             await asyncio.sleep(0.01)
     await adapter.session_update(
         "foreign-session",
@@ -158,3 +159,31 @@ async def test_foreign_acp_session_cannot_contaminate_run(adapter):
     )
     events = [item async for item in adapter.events("r1")]
     assert all(item["event"].get("delta") != "foreign" for item in events)
+
+
+async def test_two_threads_complete_independently(adapter, controlled_connection, monkeypatch):
+    connection = controlled_connection
+    session_ids = iter(["slow-session", "fast-session"])
+
+    async def new_session(**kwargs):
+        return SimpleNamespace(session_id=next(session_ids))
+
+    monkeypatch.setattr(connection, "new_session", new_session)
+    await adapter.submit("slow-run", "thread-a", "first")
+    await asyncio.wait_for(connection.first_started.wait(), 1)
+    await adapter.submit("fast-run", "thread-b", "next")
+    try:
+        async with asyncio.timeout(1):
+            fast = [event async for event in adapter.events("fast-run")]
+        assert fast[-1]["event"]["type"] == "RUN_FINISHED"
+        assert all(event["threadId"] == "thread-b" for event in fast)
+        assert not adapter.journal.terminal("slow-run")
+        await adapter.session_update(
+            "slow-session",
+            AgentMessageChunk(session_update="agent_message_chunk", content=TextContentBlock(type="text", text="A")),
+        )
+    finally:
+        connection.finish_first.set()
+    slow = [event async for event in adapter.events("slow-run")]
+    assert slow[-1]["event"]["type"] == "RUN_FINISHED"
+    assert [event["event"]["delta"] for event in slow if event["event"]["type"] == "TEXT_MESSAGE_CONTENT"] == ["A"]
