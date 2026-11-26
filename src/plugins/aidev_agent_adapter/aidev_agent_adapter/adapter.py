@@ -2,11 +2,14 @@
 
 import asyncio
 import re
+import time
 from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 
 from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process, text_block
 from acp.schema import ClientCapabilities, RequestPermissionResponse
+from opentelemetry import trace
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from .config_sync import Snapshot, private_directory
 from .events import EventMapper
@@ -86,7 +89,7 @@ class Adapter:
     def on_connect(self, conn) -> None:
         pass
 
-    async def submit(self, run_id: str, thread_id: str, text: str) -> None:
+    async def submit(self, run_id: str, thread_id: str, text: str, *, queued_ns: int | None = None) -> None:
         if self._closed:
             raise RuntimeError("adapter closed")
         if not text or len(text.encode()) > 1024 * 1024:
@@ -100,7 +103,9 @@ class Adapter:
         if len(self._tasks) >= self.settings.max_pending_runs and not self.journal.contains(run_id):
             raise RuntimeError("adapter request queue is full")
         if self.journal.claim(run_id, thread_id, request):
-            self._tasks[run_id] = asyncio.create_task(self._execute(run_id, thread_id, text))
+            now = time.time_ns()
+            start = queued_ns if type(queued_ns) is int and 0 < queued_ns <= now else now
+            self._tasks[run_id] = asyncio.create_task(self._execute(run_id, thread_id, text, start))
             self._tasks[run_id].add_done_callback(lambda task: self._tasks.pop(run_id, None))
 
     async def events(self, run_id: str, after: int = 0):
@@ -116,11 +121,19 @@ class Adapter:
                 return
             await asyncio.sleep(0.05)
 
-    async def _execute(self, run_id: str, thread_id: str, text: str) -> None:
+    async def _execute(self, run_id: str, thread_id: str, text: str, queued_ns: int) -> None:
+        tracer = trace.get_tracer(__name__)
+        queue_span = tracer.start_span("turn.queue", start_time=queued_ns, attributes={"aidev.run.id": run_id})
+        waiting = True
         try:
             async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
-                await self._run_locked(run_id, thread_id, text)
+                queue_span.end()
+                waiting = False
+                with tracer.start_as_current_span("agent.run", attributes={"aidev.run.id": run_id}):
+                    await self._run_locked(run_id, thread_id, text)
         except asyncio.CancelledError:
+            if waiting:
+                queue_span.end()
             # 取消发生在获取串行锁之前，也需要完整 RUN_STARTED / RUN_ERROR。
             self.journal.abort(run_id, "CANCELLED_BEFORE_DISPATCH", "Request cancelled before dispatch")
             raise
@@ -133,6 +146,7 @@ class Adapter:
             if thread_id in self._unrecoverable or (
                 thread_id not in self._sessions and self.journal.has_thread(thread_id, run_id)
             ):
+                trace.get_current_span().set_status(trace.StatusCode.ERROR)
                 self.journal.abort(run_id, "SESSION_NOT_RECOVERABLE", "ACP session context cannot be recovered")
                 return
             async with asyncio.timeout(self.settings.prompt_timeout):
@@ -154,6 +168,7 @@ class Adapter:
             raise
         except Exception:
             self._unrecoverable.add(thread_id)
+            trace.get_current_span().set_status(trace.StatusCode.ERROR)
             code = "EVENT_MAPPING_FAILED" if mapping_failed.is_set() else "EXECUTION_UNKNOWN"
             self.journal.abort(run_id, code, "ACP execution interrupted; outcome unknown")
         finally:
@@ -164,7 +179,16 @@ class Adapter:
                         await asyncio.wait_for(self._connection.cancel(session_id=session_id), timeout=2)
 
     async def _prompt(self, session_id: str, text: str, mapping_failed: asyncio.Event):
-        prompt = asyncio.create_task(self._connection.prompt(session_id=session_id, prompt=[text_block(text)]))
+        carrier = {}
+        if self.settings.engine == "openclaw":
+            TraceContextTextMapPropagator().inject(carrier)
+        prompt = asyncio.create_task(
+            self._connection.prompt(
+                session_id=session_id,
+                prompt=[text_block(text)],
+                **carrier,
+            )
+        )
         failed = asyncio.create_task(mapping_failed.wait())
         try:
             await asyncio.wait({prompt, failed}, return_when=asyncio.FIRST_COMPLETED)

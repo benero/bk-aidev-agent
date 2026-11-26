@@ -3,9 +3,12 @@
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from opentelemetry import context
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -32,9 +35,11 @@ def origin(url):
     return target.hostname, target.port or 443
 
 
-async def serve_session(adapter, url, session, ticket, epoch):
+async def serve_session(adapter, url, session, ticket, epoch, carrier=None):
     async with DirectConnection(url, max_size=2**21) as socket:
-        await send_frame(socket, "session.register", session_code=session, ticket=ticket, epoch=epoch)
+        await send_frame(
+            socket, "session.register", session_code=session, ticket=ticket, epoch=epoch, **(carrier or {})
+        )
         registered = json.loads(await asyncio.wait_for(socket.recv(), 15))
         if registered.get("type") != "session.ready" or registered.get("epoch") != epoch:
             raise ValueError("session registration rejected")
@@ -65,7 +70,12 @@ async def serve_session(adapter, url, session, ticket, epoch):
                 if sender:
                     await sender
                 if kind == "chat.submit":
-                    await adapter.submit(run_id, session, frame["text"])
+                    parent = TraceContextTextMapPropagator().extract(frame)
+                    token = context.attach(parent)
+                    try:
+                        await adapter.submit(run_id, session, frame["text"], queued_ns=frame.get("queued_ns"))
+                    finally:
+                        context.detach(token)
                 if not adapter.journal.belongs_to(run_id, session):
                     await send_frame(socket, "session.unknown", run_id=run_id)
                     continue
@@ -82,6 +92,7 @@ async def serve_session(adapter, url, session, ticket, epoch):
 async def serve_runner(adapter: Adapter, url: str, ticket_file: Path, sandbox_id: str):
     expected_origin = origin(url)
     sessions = {}
+    startup_parent = os.environ.get("AIDEV_STARTUP_TRACEPARENT")
 
     def finish(key, done):
         if sessions.get(key) is done:
@@ -95,11 +106,16 @@ async def serve_runner(adapter: Adapter, url: str, ticket_file: Path, sandbox_id
             try:
                 async with DirectConnection(url, max_size=65536) as socket:
                     await send_frame(
-                        socket, "runner.register", sandbox_id=sandbox_id, ticket=ticket_file.read_text().strip()
+                        socket,
+                        "runner.register",
+                        sandbox_id=sandbox_id,
+                        ticket=ticket_file.read_text().strip(),
+                        **({"traceparent": startup_parent} if startup_parent else {}),
                     )
                     ready = json.loads(await asyncio.wait_for(socket.recv(), 15))
                     if ready.get("type") != "runner.ready":
                         raise ValueError("runner registration rejected")
+                    startup_parent = None
                     epoch = ready["epoch"]
                     delay = 1
                     loop = asyncio.get_running_loop()
@@ -128,7 +144,15 @@ async def serve_runner(adapter: Adapter, url: str, ticket_file: Path, sandbox_id
                             task.cancel()
                             await asyncio.gather(task, return_exceptions=True)
                         sessions[session] = asyncio.create_task(
-                            serve_session(adapter, frame["url"], session, frame["ticket"], epoch), name=str(epoch)
+                            serve_session(
+                                adapter,
+                                frame["url"],
+                                session,
+                                frame["ticket"],
+                                epoch,
+                                {k: frame[k] for k in ("traceparent", "tracestate") if k in frame},
+                            ),
+                            name=str(epoch),
                         )
                         sessions[session].add_done_callback(lambda done, key=session: finish(key, done))
             except (ConnectionClosed, OSError, TimeoutError):

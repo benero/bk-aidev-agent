@@ -13,6 +13,11 @@ from dataclasses import replace
 from pathlib import Path
 
 import httpx
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from aidev_agent_adapter.adapter import Adapter
 from aidev_agent_adapter.cli import load_settings
@@ -73,6 +78,31 @@ async def run(config: Path, prompt: str | None) -> None:
     if not binary:
         raise RuntimeError("install openclaw in the sandbox first")
     settings.native_config["gateway"] = {"mode": "local", "bind": "loopback", "port": 18789}
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if endpoint:
+        provider = TracerProvider(resource=Resource.create({"service.name": "aidev-agent-adapter"}))
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        trace.set_tracer_provider(provider)
+        plugins = settings.native_config.setdefault("plugins", {})
+        allowed = plugins.setdefault("allow", ["openai"])
+        if "diagnostics-otel" not in allowed:
+            allowed.append("diagnostics-otel")
+        plugins.setdefault("entries", {})["diagnostics-otel"] = {"enabled": True}
+        plugins.setdefault("load", {}).setdefault("paths", []).append(
+            "/app/otel/node_modules/@openclaw/diagnostics-otel"
+        )
+        settings.native_config["diagnostics"] = {
+            "enabled": True,
+            "otel": {
+                "enabled": True,
+                "traces": True,
+                "metrics": False,
+                "logs": False,
+                "captureContent": False,
+                "serviceName": "openclaw-gateway",
+            },
+        }
+        settings.engine_env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
     client = PlatformClient(settings)
     if prompt is None and "AIDEV_PREVIEW_CONFIG" in os.environ:
         client.preview_config = json.loads(os.environ.pop("AIDEV_PREVIEW_CONFIG"))

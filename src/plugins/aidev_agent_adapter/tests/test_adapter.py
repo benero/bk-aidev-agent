@@ -7,6 +7,10 @@ from acp.schema import AgentMessageChunk, TextContentBlock
 from aidev_agent_adapter.adapter import Adapter
 from aidev_agent_adapter.events import EventMapper
 from aidev_agent_adapter.journal import Journal
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 
 async def collect(adapter, run_id="r1", thread_id="t1", text="hello", after=0):
@@ -187,3 +191,44 @@ async def test_two_threads_complete_independently(adapter, controlled_connection
     slow = [event async for event in adapter.events("slow-run")]
     assert slow[-1]["event"]["type"] == "RUN_FINISHED"
     assert [event["event"]["delta"] for event in slow if event["event"]["type"] == "TEXT_MESSAGE_CONTENT"] == ["A"]
+
+
+async def test_interleaved_runs_propagate_own_parent_to_acp(adapter, controlled_connection, monkeypatch):
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer(__name__)
+    monkeypatch.setattr(trace, "get_tracer", lambda name: tracer)
+    seen = {}
+    original_prompt = controlled_connection.prompt
+
+    async def capture(session_id, prompt, **metadata):
+        seen[prompt[0].text] = metadata["traceparent"]
+        return await original_prompt(session_id, prompt)
+
+    monkeypatch.setattr(controlled_connection, "prompt", capture)
+    for run, text in [("a", "first"), ("b", "second")]:
+        with tracer.start_as_current_span(run):
+            await adapter.submit(run, run, text)
+        if run == "a":
+            await asyncio.wait_for(controlled_connection.first_started.wait(), 1)
+    try:
+        await asyncio.wait_for(controlled_connection.second_started.wait(), 1)
+    finally:
+        controlled_connection.finish_first.set()
+    for run in ("a", "b"):
+        events = [item async for item in adapter.events(run)]
+        assert events[-1]["event"]["type"] == "RUN_FINISHED"
+    spans = exporter.get_finished_spans()
+    parents = {span.name: span.context for span in spans if span.name in {"a", "b"}}
+    assert parents["a"].trace_id != parents["b"].trace_id
+    for span_name in ("turn.queue", "agent.run"):
+        children = [span for span in spans if span.name == span_name]
+        assert len(children) == 2
+        for span in children:
+            run = span.attributes["aidev.run.id"]
+            assert span.parent.span_id == parents[run].span_id
+            if span_name == "agent.run":
+                carrier = seen["first" if run == "a" else "second"].split("-")
+                assert int(carrier[1], 16) == parents[run].trace_id
+                assert int(carrier[2], 16) == span.context.span_id

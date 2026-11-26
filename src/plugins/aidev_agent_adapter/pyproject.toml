@@ -1,11 +1,13 @@
 [project]
 name = "aidev-agent-adapter"
-version = "0.2.4"
+version = "0.2.5"
 description = "AIDev configuration sync and ACP to AG-UI adapter"
 readme = "readme.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
+  "opentelemetry-sdk>=1.33,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.33,<2",
   "agent-client-protocol>=0.12.1,<0.13",
   "ag-ui-protocol>=0.1.10,<0.2",
   "httpx>=0.28,<1",
