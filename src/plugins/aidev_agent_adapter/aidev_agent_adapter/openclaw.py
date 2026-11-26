@@ -12,6 +12,8 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
+
 from aidev_agent_adapter.adapter import Adapter
 from aidev_agent_adapter.cli import load_settings
 from aidev_agent_adapter.config_sync import ConfigSynchronizer, private_directory
@@ -38,6 +40,26 @@ def install_user_config(settings, snapshot, user_root):
         finally:
             stage.unlink(missing_ok=True)
     return replace(snapshot, engine_config=target)
+
+
+async def wait_for_gateway(gateway: asyncio.subprocess.Process) -> None:
+    # Leave time for Runner registration within Channel's 120-second startup window.
+    last_status = "not probed"
+    async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+        try:
+            async with asyncio.timeout(100):
+                while gateway.returncode is None:
+                    try:
+                        response = await client.get("http://127.0.0.1:18789/readyz")
+                        if response.status_code == 200:
+                            return
+                        last_status = f"HTTP {response.status_code}"
+                    except httpx.RequestError as exc:
+                        last_status = type(exc).__name__
+                    await asyncio.sleep(1)
+                raise RuntimeError(f"OpenClaw Gateway exited with status {gateway.returncode}")
+        except TimeoutError as exc:
+            raise RuntimeError(f"OpenClaw Gateway readiness timed out; last probe: {last_status}") from exc
 
 
 async def run(config: Path, prompt: str | None) -> None:
@@ -96,26 +118,7 @@ async def run(config: Path, prompt: str | None) -> None:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        async with asyncio.timeout(60):
-            while gateway.returncode is None:
-                probe = await asyncio.create_subprocess_exec(
-                    binary,
-                    "gateway",
-                    "health",
-                    env=env,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                try:
-                    if await probe.wait() == 0:
-                        break
-                finally:
-                    if probe.returncode is None:
-                        probe.kill()
-                        await probe.wait()
-                await asyncio.sleep(1)
-            else:
-                raise RuntimeError("OpenClaw Gateway exited before becoming ready")
+        await wait_for_gateway(gateway)
         if prompt is None:
             await serve_runner(
                 adapter,
