@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 from ag_ui.core import (
@@ -20,8 +21,9 @@ from .config_sync import private_directory
 
 
 class Journal:
-    def __init__(self, root: Path, identity: str):
+    def __init__(self, root: Path, identity: str, on_event: Callable[[str], None] | None = None):
         self.root = private_directory(root)
+        self._on_event = on_event
         self._lock = (self.root / ".journal.lock").open("a")
         self.db = None
         try:
@@ -132,6 +134,8 @@ class Journal:
         self.db.execute("INSERT INTO events VALUES (?,?,?)", (run_id, sequence, json.dumps(envelope)))
         if terminal:
             self.db.execute("UPDATE runs SET terminal=1 WHERE run_id=?", (run_id,))
+        if self._on_event is not None:
+            self._on_event(run_id)
 
     def abort(self, run_id: str, code: str, message: str) -> None:
         """从已提交日志恢复开放的事件，整个收口事务原子提交，可重复调用。"""

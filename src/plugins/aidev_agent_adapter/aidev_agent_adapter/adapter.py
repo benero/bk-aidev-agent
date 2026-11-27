@@ -23,9 +23,11 @@ class Adapter:
     def __init__(self, settings: Settings, snapshot: Snapshot):
         self.settings = settings
         self.snapshot = snapshot
-        self.journal = Journal(settings.root / "journal", settings.identity)
+        self._run_signals: dict[str, asyncio.Event] = {}
+        self.journal = Journal(settings.root / "journal", settings.identity, on_event=self._notify_run)
         self._stack = AsyncExitStack()
         self._connection = None
+        self._process = None
         self._sessions: dict[str, str] = {}
         self._active: dict[str, tuple[EventMapper, asyncio.Event]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
@@ -34,6 +36,11 @@ class Adapter:
         self._closed = False
         self._unrecoverable: set[str] = set()
 
+    def _notify_run(self, run_id: str) -> None:
+        signal = self._run_signals.get(run_id)
+        if signal is not None:
+            signal.set()
+
     def session_directory(self, thread_id: str) -> Path:
         if not self.settings.mounted_storage:
             return self.snapshot.workspace
@@ -41,7 +48,19 @@ class Adapter:
             raise ValueError("invalid session code")
         return private_directory(SESSION_VOLUME / thread_id)
 
+    async def _reset_dead_connection(self) -> None:
+        if self._connection is not None and self._process is not None and self._process.returncode is not None:
+            self._connection = None
+            self._process = None
+            # 底层 ACP 进程退出后，内存中旧会话句柄全部失效，允许新会话重新建连。
+            self._unrecoverable.update(self._sessions.keys())
+            self._sessions.clear()
+            with suppress(Exception):
+                await self._stack.aclose()
+            self._stack = AsyncExitStack()
+
     async def _connect(self) -> None:
+        await self._reset_dead_connection()
         if self._connection is not None:
             return
         command = self.settings.command or [self.settings.engine, "acp"]
@@ -54,7 +73,7 @@ class Adapter:
             "OPENCLAW_SUPPRESS_NOTES": "1",
         }
         async with AsyncExitStack() as startup:
-            connection, _ = await startup.enter_async_context(
+            connection, process = await startup.enter_async_context(
                 spawn_agent_process(
                     self,
                     *command,
@@ -66,6 +85,7 @@ class Adapter:
             await connection.initialize(protocol_version=PROTOCOL_VERSION, client_capabilities=ClientCapabilities())
             self._stack.push_async_callback(startup.pop_all().aclose)
         self._connection = connection
+        self._process = process
 
     async def request_permission(self, session_id, tool_call, options, **kwargs):
         # 第一版不提供自动授权；后续由 Channel 接入显式用户确认。
@@ -110,16 +130,23 @@ class Adapter:
 
     async def events(self, run_id: str, after: int = 0):
         """断开消费者不会取消执行；携带原 run_id 和 cursor 再次调用即可续传。"""
-        while True:
-            batch = self.journal.replay(run_id, after)
-            for envelope in batch:
-                after = envelope["sequence"]
-                yield envelope
-            if batch:
-                continue
+        signal = self._run_signals.setdefault(run_id, asyncio.Event())
+        try:
+            while True:
+                signal.clear()
+                batch = self.journal.replay(run_id, after)
+                for envelope in batch:
+                    after = envelope["sequence"]
+                    yield envelope
+                if batch:
+                    continue
+                if self.journal.terminal(run_id):
+                    return
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(signal.wait(), timeout=0.5)
+        finally:
             if self.journal.terminal(run_id):
-                return
-            await asyncio.sleep(0.05)
+                self._run_signals.pop(run_id, None)
 
     async def _execute(self, run_id: str, thread_id: str, text: str, queued_ns: int) -> None:
         tracer = trace.get_tracer(__name__)

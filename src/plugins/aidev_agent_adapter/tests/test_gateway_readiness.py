@@ -1,8 +1,11 @@
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from aidev_agent_adapter.openclaw import wait_for_gateway
+from aidev_agent_adapter import openclaw
+from aidev_agent_adapter.openclaw import configure_otel, run_runner_with_gateway, wait_for_gateway
 
 
 async def test_register_only_after_gateway_is_ready(monkeypatch):
@@ -21,3 +24,33 @@ async def test_register_only_after_gateway_is_ready(monkeypatch):
 async def test_gateway_exit_is_reported_before_registration():
     with pytest.raises(RuntimeError, match="status 7"):
         await wait_for_gateway(SimpleNamespace(returncode=7))
+
+
+async def test_run_runner_with_gateway_aborts_when_gateway_exits():
+    cancelled = False
+
+    async def fake_runner():
+        nonlocal cancelled
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    class _DyingGateway:
+        async def wait(self):
+            await asyncio.sleep(0.02)
+            return 137
+
+    with pytest.raises(RuntimeError, match="status 137"):
+        await run_runner_with_gateway(_DyingGateway(), fake_runner())
+    assert cancelled is True
+
+
+def test_configure_otel_skips_missing_plugin_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(openclaw, "OTEL_PLUGIN_DIR", Path(tmp_path / "missing-plugin"))
+    monkeypatch.setattr(openclaw.trace, "set_tracer_provider", lambda provider: None)
+    settings = SimpleNamespace(native_config={}, engine_env={})
+    configure_otel(settings, "http://127.0.0.1:4318")
+    assert "diagnostics" not in settings.native_config
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in settings.engine_env

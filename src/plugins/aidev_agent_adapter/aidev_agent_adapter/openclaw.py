@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -25,6 +26,9 @@ from aidev_agent_adapter.config_sync import ConfigSynchronizer, private_director
 from aidev_agent_adapter.gateway_recovery import recover_confirmed_owner
 from aidev_agent_adapter.platform import PlatformClient
 from aidev_agent_adapter.runner import serve_runner
+
+logger = logging.getLogger(__name__)
+OTEL_PLUGIN_DIR = Path("/app/otel/node_modules/@openclaw/diagnostics-otel")
 
 
 def install_user_config(settings, snapshot, user_root):
@@ -68,6 +72,55 @@ async def wait_for_gateway(gateway: asyncio.subprocess.Process) -> None:
             raise RuntimeError(f"OpenClaw Gateway readiness timed out; last probe: {last_status}") from exc
 
 
+async def run_runner_with_gateway(gateway: asyncio.subprocess.Process, runner_coro) -> None:
+    """联动监控 Gateway 与 Runner；Gateway 异常退出时立即中止 Runner，避免僵尸心跳。"""
+    runner_task = asyncio.create_task(runner_coro)
+    gateway_task = asyncio.create_task(gateway.wait())
+    try:
+        done, pending = await asyncio.wait({runner_task, gateway_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if gateway_task in done and runner_task not in done:
+            raise RuntimeError(f"OpenClaw Gateway exited unexpectedly with status {gateway_task.result()}")
+        runner_task.result()
+    finally:
+        for task in (runner_task, gateway_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(runner_task, gateway_task, return_exceptions=True)
+
+
+def configure_otel(settings, endpoint: str) -> None:
+    provider = TracerProvider(resource=Resource.create({"service.name": "aidev-agent-adapter"}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+    if not OTEL_PLUGIN_DIR.is_dir():
+        logger.warning(
+            "OpenClaw diagnostics-otel plugin directory not found (%s); skipping engine OTLP plugin",
+            OTEL_PLUGIN_DIR,
+        )
+        return
+    plugins = settings.native_config.setdefault("plugins", {})
+    allowed = plugins.setdefault("allow", ["openai"])
+    if "diagnostics-otel" not in allowed:
+        allowed.append("diagnostics-otel")
+    plugins.setdefault("entries", {})["diagnostics-otel"] = {"enabled": True}
+    plugins.setdefault("load", {}).setdefault("paths", []).append(str(OTEL_PLUGIN_DIR))
+    settings.native_config["diagnostics"] = {
+        "enabled": True,
+        "otel": {
+            "enabled": True,
+            "traces": True,
+            "metrics": False,
+            "logs": False,
+            "captureContent": False,
+            "serviceName": "openclaw-gateway",
+        },
+    }
+    settings.engine_env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+
+
 async def run(config: Path, prompt: str | None) -> None:
     if sys.platform != "linux" or Path.cwd().resolve() not in {Path("/opt/adapter"), Path("/app/workspace")}:
         raise RuntimeError("use the OpenClaw sandbox image entrypoint")
@@ -80,29 +133,7 @@ async def run(config: Path, prompt: str | None) -> None:
     settings.native_config["gateway"] = {"mode": "local", "bind": "loopback", "port": 18789}
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
     if endpoint:
-        provider = TracerProvider(resource=Resource.create({"service.name": "aidev-agent-adapter"}))
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-        trace.set_tracer_provider(provider)
-        plugins = settings.native_config.setdefault("plugins", {})
-        allowed = plugins.setdefault("allow", ["openai"])
-        if "diagnostics-otel" not in allowed:
-            allowed.append("diagnostics-otel")
-        plugins.setdefault("entries", {})["diagnostics-otel"] = {"enabled": True}
-        plugins.setdefault("load", {}).setdefault("paths", []).append(
-            "/app/otel/node_modules/@openclaw/diagnostics-otel"
-        )
-        settings.native_config["diagnostics"] = {
-            "enabled": True,
-            "otel": {
-                "enabled": True,
-                "traces": True,
-                "metrics": False,
-                "logs": False,
-                "captureContent": False,
-                "serviceName": "openclaw-gateway",
-            },
-        }
-        settings.engine_env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+        configure_otel(settings, endpoint)
     client = PlatformClient(settings)
     if prompt is None and "AIDEV_PREVIEW_CONFIG" in os.environ:
         client.preview_config = json.loads(os.environ.pop("AIDEV_PREVIEW_CONFIG"))
@@ -110,6 +141,8 @@ async def run(config: Path, prompt: str | None) -> None:
         snapshot = await ConfigSynchronizer(settings, client).sync()
     finally:
         await client.close()
+    if prompt is None:
+        os.environ.pop("AIDEV_ACCESS_TOKEN", None)
 
     if settings.mounted_storage:
         snapshot = install_user_config(settings, snapshot, Path("/app/.storage/user"))
@@ -134,6 +167,9 @@ async def run(config: Path, prompt: str | None) -> None:
     settings.command = [binary, "acp"]
     adapter = Adapter(settings, snapshot)
     gateway = None
+    gateway_log_path = private_directory(settings.root / "logs") / "gateway.stderr.log"
+    gateway_log = gateway_log_path.open("wb")
+    os.chmod(gateway_log_path, 0o600)
     try:
         if prompt is None and settings.mounted_storage:
             exited_hosts = os.environ.get("CHANNEL_CONFIRMED_EXITED_GATEWAYS", "").split()
@@ -150,15 +186,18 @@ async def run(config: Path, prompt: str | None) -> None:
             "token",
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=gateway_log,
         )
         await wait_for_gateway(gateway)
         if prompt is None:
-            await serve_runner(
-                adapter,
-                os.environ["CHANNEL_RUNNER_URL"],
-                Path(os.environ["CHANNEL_RUNNER_TICKET_FILE"]),
-                os.environ["SANDBOX_ID"],
+            await run_runner_with_gateway(
+                gateway,
+                serve_runner(
+                    adapter,
+                    os.environ["CHANNEL_RUNNER_URL"],
+                    Path(os.environ["CHANNEL_RUNNER_TICKET_FILE"]),
+                    os.environ["SANDBOX_ID"],
+                ),
             )
             return
         run_id = uuid.uuid4().hex
@@ -171,13 +210,16 @@ async def run(config: Path, prompt: str | None) -> None:
         try:
             await adapter.close()
         finally:
-            if gateway and gateway.returncode is None:
-                gateway.terminate()
-                try:
-                    await asyncio.wait_for(gateway.wait(), 10)
-                except TimeoutError:
-                    gateway.kill()
-                    await gateway.wait()
+            try:
+                if gateway and gateway.returncode is None:
+                    gateway.terminate()
+                    try:
+                        await asyncio.wait_for(gateway.wait(), 10)
+                    except TimeoutError:
+                        gateway.kill()
+                        await gateway.wait()
+            finally:
+                gateway_log.close()
 
 
 def main() -> None:
