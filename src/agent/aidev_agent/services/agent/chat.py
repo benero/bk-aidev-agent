@@ -95,7 +95,7 @@ from aidev_agent.utils.migrations import (
     migration_model_context_options_from_agent_options_v1,
     normalize_doc_schema_payload,
 )
-from aidev_agent.utils.tracing import recording_span
+from aidev_agent.utils.tracing import current_otel_context, recording_span
 
 try:
     from aidev_agent.packages.opentelemetry.resilience import record_operation_timeout
@@ -1475,6 +1475,9 @@ class ChatCompletionAgent(BaseModel):
             else None
         )
 
+        # The HTTP request context may be gone by the first SSE iteration.
+        producer_trace_context = current_otel_context()
+
         def stream() -> Generator[Any, None, None]:
             # 不把 observer 放进惰性生成器：HTTP 入口 span 可能在首次消费前已经结束。
             helper = GeneratorStreamingHelper(
@@ -1482,6 +1485,7 @@ class ChatCompletionAgent(BaseModel):
                 defer_cleanup_on_complete=background_only,
                 producer_observer=observer,
                 resource_manager=self.resource_manager,
+                producer_trace_context=producer_trace_context,
             )
             run_id = agent_input.run_id or self.thread_id
             cancel_event = helper.prepare_run(run_id)

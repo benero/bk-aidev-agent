@@ -150,6 +150,7 @@ class GeneratorStreamingHelper:
         defer_cleanup_on_complete: bool = False,
         producer_observer: Any = None,
         resource_manager: object | None = None,
+        producer_trace_context: tracing.Context | None = None,
     ) -> None:
         self.message_handler = message_handler if message_handler else message_handler_factory.get()
         self.thread_id = thread_id or uuid.uuid4().hex
@@ -157,6 +158,7 @@ class GeneratorStreamingHelper:
         # 保留缓存历史供前端在清理窗口内接管续流；清理交由 producer 的延迟清理线程兜底。
         self.defer_cleanup_on_complete = defer_cleanup_on_complete
         self._producer_runner = resolve_producer_runner(resource_manager)
+        self.producer_trace_context = producer_trace_context
         self.producer_observer = producer_observer
         self._producer_completion_error: Exception | None = None
         self.run_id: str = ""
@@ -700,14 +702,15 @@ class GeneratorStreamingHelper:
 
             def produce() -> None:
                 started.set()
-                self._run_producer(
-                    generator=generator,
-                    cancel_event=cancel_event,
-                    on_complete=on_complete,
-                    event_handler=event_handler,
-                    expected_run_id=expected_run_id,
-                    release_producer=not worker_owns_lock,
-                )
+                with tracing.use_otel_context(self.producer_trace_context):
+                    self._run_producer(
+                        generator=generator,
+                        cancel_event=cancel_event,
+                        on_complete=on_complete,
+                        event_handler=event_handler,
+                        expected_run_id=expected_run_id,
+                        release_producer=not worker_owns_lock,
+                    )
 
             run = partial(producer_context.run, produce)
             try:

@@ -1,6 +1,7 @@
 """Resume envelopes retain the entry context even when stream consumption is deferred."""
 
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ from aidev_agent.core.ag_ui.types import AgentInput
 from aidev_agent.services import resume_events
 from aidev_agent.services.agent import chat
 from aidev_agent.services.agent.chat import ChatCompletionAgent
+from aidev_agent.services.messages_handler import GeneratorStreamingHelper, InMemoryQueueMessageHandler
 
 pytest.importorskip("opentelemetry.trace")
 
@@ -81,6 +83,28 @@ class TestResumeTraceContext:
             assert call.args[0].value["traceContext"] == expected
         case.helper.prepare_run.assert_called_once_with("run")
         assert case.agent._build_resume_aware_producer.call_args.kwargs["producer_observer"] is observer
+
+    def test_deferred_producer_inherits_request_instead_of_consumer(self, case, monkeypatch):
+        handler = InMemoryQueueMessageHandler()
+        monkeypatch.setattr(
+            chat, "GeneratorStreamingHelper", partial(GeneratorStreamingHelper, message_handler=handler)
+        )
+        case.agent.resource_manager = None
+        seen = []
+
+        def produce():
+            seen.append(trace.get_current_span().get_span_context())
+            yield "chunk"
+
+        case.agent._build_resume_aware_producer.return_value = produce()
+        entry = _span(1)
+        consumer = _span(2)
+        with trace.use_span(entry):
+            stream = self.stream(case)
+        with trace.use_span(consumer):
+            assert "chunk" in list(stream)
+            assert trace.get_current_span() is consumer
+        assert seen == [entry.get_span_context()]
 
     def test_interleaved_requests_do_not_share_context(self, case):
         streams = []

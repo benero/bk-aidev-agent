@@ -10,12 +10,14 @@ from typing import Any
 try:
     from opentelemetry import context as context_api
     from opentelemetry import trace
+    from opentelemetry.context import Context
     from opentelemetry.trace import SpanKind, Tracer
     from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 except ImportError:  # OpenTelemetry is an optional Agent SDK extra.
     context_api = None
     trace = None
     SpanKind = None
+    Context = Any
     Tracer = Any
     TraceContextTextMapPropagator = None
 
@@ -60,6 +62,22 @@ def get_current_trace_id() -> str | None:
         return None
     context = trace.get_current_span().get_span_context()
     return format(context.trace_id, "032x") if context.trace_id else None
+
+
+def current_otel_context() -> Context | None:
+    return context_api.get_current() if context_api is not None else None
+
+
+@contextmanager
+def use_otel_context(context: Context | None) -> Iterator[None]:
+    if context is None or context_api is None:
+        yield
+        return
+    token = context_api.attach(context)
+    try:
+        yield
+    finally:
+        context_api.detach(token)
 
 
 def trace_headers() -> dict[str, str]:
